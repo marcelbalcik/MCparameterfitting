@@ -9,6 +9,10 @@ results/
 work_test/
 results_test/
 
+# Experimental MMD curves you drop in for the --stage-ki fit (your raw data).
+# Remove this line if you WANT to version your experimental MMDs in the repo.
+exp_mmd/
+
 # mcPolymer engine scratch that may leak into the repo root during ad-hoc runs
 mcPolymerSimulationresults-ID_*/
 ip_active.mcPolymer

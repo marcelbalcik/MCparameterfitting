@@ -12,9 +12,10 @@ Run it on the workstation where the mcPolymer engine lives:
     python main.py --eval-once      # one parallel fan-out for a fixed theta -> global loss
     python main.py --screen         # ki/kp sensitivity + stochastic noise floor
     python main.py --stage1         # decoupled per-temperature k warm start + Arrhenius seed
-    python main.py --stage2         # coupled global (A_ki,Ea_ki,A_kp,Ea_kp) refinement
+    python main.py --stage-ki       # determine ki from the 10-min MMD shape (BETWEEN stage1 & stage2)
+    python main.py --stage2         # coupled Arrhenius refinement (holds ki fixed if stage-ki ran)
     python main.py --verify         # re-run best fit K times at verification resolution
-    python main.py --all            # setup -> stage1 -> stage2 -> verify -> report
+    python main.py --all            # setup -> stage1 -> stage-ki -> screen -> stage2 -> verify -> report
     python main.py --report         # (re)write report.md + plots from the latest results
 
 The stages are deliberately independent so each can be validated on its own
@@ -169,9 +170,11 @@ CONFIG = {
     "subprocess_timeout_s": 7200,             # per driver run
 
     # ---- Stage 1: decoupled per-temperature k fit ---------------------------
+    # Worst-case sim evaluations per temperature level = (maxiter+1)*popsize*2
+    # (2-D: ki,kp). (14+1)*6*2 = 180 (< 200); it usually stops earlier via tol.
     "stage1_k_bounds_log10": [-6.0, 3.0],     # bounds on log10(k) [L/(mol s)] per coefficient
-    "stage1_maxiter":        30,
-    "stage1_popsize":        12,
+    "stage1_maxiter":        14,
+    "stage1_popsize":        6,
     "stage1_tol":            1e-3,
 
     # ---- Stage 2: coupled global Arrhenius fit ------------------------------
@@ -185,6 +188,29 @@ CONFIG = {
     "stage2_mutation":       [0.5, 1.0],
     "stage2_recombination":  0.7,
     "cma_sigma0":            0.5,             # CMA-ES only (in normalized [0,1] box units)
+
+    # ---- Stage 3 (MMD): fit ki from the early-time molar-mass DISTRIBUTION ---
+    # You provide the experimental curve(s) as two-column log10(M) vs dw/dlog10(M)
+    # files (same format as the sim output), one per experiment/time, named by
+    # exp_mmd_pattern inside exp_mmd_dir, e.g. exp_mmd/TW60_MMD-600.dat.
+    # Any experiment without a file is silently skipped (per-experiment optional).
+    "exp_mmd_dir":           "exp_mmd",
+    "exp_mmd_pattern":       "{code}_MMD-{t}.dat",
+    "mmd_fit_times_s":       [600],            # 10 min; add more times to use them too
+    "mmd_metric":            "l2",             # "l2" | "wasserstein" | "dispersity"
+    "mmd_grid_points":       400,              # shared log10(M) grid resolution
+    "mmd_force_x_col":       "auto",           # orientation of the EXP file (auto|c0|c1|swap)
+    "mmd_mn_weight":         0.0,              # optional Mn term alongside the shape term (0=shape only)
+    # This stage runs BETWEEN stage 1 and stage 2: it determines an effective
+    # ki(T) per temperature from the MMD shape (holding kp(T) at the stage-1
+    # value), THEN stage 2 sets the Arrhenius constants with ki held fixed.
+    # With MMDs at >=2 temperatures Ea_ki is identifiable from the ki(T) points;
+    # with one temperature Ea_ki is held at mmd_fixed_Ea_kJ (None -> the stage-1
+    # seed's Ea_ki) and only ki(T) (hence A_ki) is determined.
+    "mmd_fixed_Ea_kJ":       None,
+    "mmd_ki_maxiter":        30,
+    "mmd_ki_popsize":        12,
+    "mmd_ki_tol":            1e-2,
 
     # ---- reproducibility -----------------------------------------------------
     "seed":                  20260704,
@@ -481,13 +507,11 @@ def coeffs_for(exp: Experiment, params: dict) -> dict:
     }
 
 
-def run_all(exps, coeffs_by_code: dict, numMolecules: int, K: int) -> dict:
-    """Fan out: for each experiment, run K replicates, average Mn/Mw/D per time.
-
-    coeffs_by_code: {code: {"ki":.., "kp":..}}
-    Returns {code: {"per_time": {t: {Mn,Mw,D}}, "reps": [...], "errors": [...]}}.
-    """
-    # build the flat task list: (exp, rep_index, run_dir)
+def _launch_fanout(exps, coeffs_by_code: dict, numMolecules: int, K: int) -> dict:
+    """Run the driver for every (experiment x replicate) in parallel.
+    Returns {code: [(rep_idx, run_dir, ok, msg), ...]}.  Shared by the Mn path
+    (run_all) and the MMD-shape path (collect_curves) so the fan-out logic and
+    error handling live in exactly one place."""
     tasks = []
     for exp in exps:
         folder = experiment_folder(exp)
@@ -496,8 +520,7 @@ def run_all(exps, coeffs_by_code: dict, numMolecules: int, K: int) -> dict:
             _ensure_rundir(exp, run_dir, numMolecules, coeffs_by_code[exp.code])
             tasks.append((exp, r, run_dir))
 
-    results = {exp.code: {"per_time_reps": [], "errors": []} for exp in exps}
-
+    out = {exp.code: [] for exp in exps}
     max_workers = max(1, min(CONFIG["max_workers"], len(tasks)))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         fut2task = {pool.submit(run_driver, rd): (exp, r, rd) for (exp, r, rd) in tasks}
@@ -505,8 +528,24 @@ def run_all(exps, coeffs_by_code: dict, numMolecules: int, K: int) -> dict:
             exp, r, rd = fut2task[fut]
             ok, msg = fut.result()
             if not ok:
-                results[exp.code]["errors"].append(f"rep{r}: {msg}")
                 LOG.warning("[run] %s rep%d FAILED: %s", exp.code, r, msg)
+            out[exp.code].append((r, rd, ok, msg))
+    return out
+
+
+def run_all(exps, coeffs_by_code: dict, numMolecules: int, K: int) -> dict:
+    """Fan out: for each experiment, run K replicates, average Mn/Mw/D per time.
+
+    coeffs_by_code: {code: {"ki":.., "kp":..}}
+    Returns {code: {"per_time": {t: {Mn,Mw,D}}, "reps": [...], "errors": [...]}}.
+    """
+    fanout = _launch_fanout(exps, coeffs_by_code, numMolecules, K)
+    results = {exp.code: {"per_time_reps": [], "errors": []} for exp in exps}
+
+    for exp in exps:
+        for (r, rd, ok, msg) in fanout[exp.code]:
+            if not ok:
+                results[exp.code]["errors"].append(f"rep{r}: {msg}")
                 continue
             try:
                 metrics = extract_metrics(rd, exp.fit_times_s)
@@ -532,6 +571,130 @@ def run_all(exps, coeffs_by_code: dict, numMolecules: int, K: int) -> dict:
                 }
         results[exp.code]["per_time"] = per_time
     return results
+
+
+# =============================================================================
+# MMD-shape observable  (fit ki from the early-time molar-mass DISTRIBUTION)
+# =============================================================================
+# The 10-min distribution SHAPE (peak position + breadth), not just its Mn,
+# carries the initiation-broadening signal that pins ki.  The sim already
+# exports MMD-S-600.dat every run, so the simulated side is free; we only add
+# the experimental curve + a distribution distance.
+#
+# Consistency note on the M-axis: n_I,eff is derived from the SEC Mn(720), so
+# the simulation's absolute molar-mass axis is tied to the SAME SEC calibration
+# as the experimental curve — L2 over log10(M) is therefore meaningful. If your
+# SEC M-axis is only relative/PS-equivalent, prefer mmd_metric="dispersity" or
+# "wasserstein" (less sensitive to an absolute peak-position offset).
+
+def load_norm_curve(path: Path, force: str):
+    """Load a two-column MMD -> (x=log10 M, w=dw/dlog10 M) normalized to unit area."""
+    df2 = mwd.load_first_two_numeric_cols(path)
+    df_xy, _ = mwd.choose_xy_as_logm(df2, force=force)
+    x = df_xy["x"].to_numpy(dtype=float)
+    y = df_xy["y"].to_numpy(dtype=float)
+    area = float(np.trapezoid(y, x))
+    if not np.isfinite(area) or area <= 0:
+        raise ValueError("invalid/zero area in MMD curve")
+    return x, y / area
+
+
+def exp_mmd_path(code: str, t_s: int) -> Path:
+    pat = CONFIG["exp_mmd_pattern"].format(code=code, t=int(t_s))
+    return Path(CONFIG["repo_dir"]) / CONFIG["exp_mmd_dir"] / pat
+
+
+def load_exp_curves(exps, times):
+    """{code: {t: (x, w)}} for every experiment/time that HAS a provided exp MMD.
+    Experiments without a file are simply omitted (per-experiment optional)."""
+    curves = {}
+    for e in exps:
+        per_t = {}
+        for t in times:
+            p = exp_mmd_path(e.code, t)
+            if p.exists():
+                try:
+                    per_t[int(t)] = load_norm_curve(p, CONFIG["mmd_force_x_col"])
+                except Exception as ex:
+                    LOG.warning("[mmd] %s t=%ss: could not read %s (%s)", e.code, t, p, ex)
+        if per_t:
+            curves[e.code] = per_t
+    return curves
+
+
+def _common_grid_interp(x_a, w_a, x_b, w_b, npts):
+    """Put two normalized densities on a shared log10(M) grid (0-filled tails),
+    renormalized to unit area on that grid."""
+    lo = min(float(x_a.min()), float(x_b.min()))
+    hi = max(float(x_a.max()), float(x_b.max()))
+    grid = np.linspace(lo, hi, int(npts))
+    wa = np.interp(grid, x_a, w_a, left=0.0, right=0.0)
+    wb = np.interp(grid, x_b, w_b, left=0.0, right=0.0)
+    aa = float(np.trapezoid(wa, grid)); ab = float(np.trapezoid(wb, grid))
+    if aa > 0:
+        wa = wa / aa
+    if ab > 0:
+        wb = wb / ab
+    return grid, wa, wb
+
+
+def shape_distance(sim_curve, exp_curve, metric: str, npts: int) -> float:
+    """Distance between two normalized MMD curves.  sim/exp = (x=log10 M, w)."""
+    x_s, w_s = sim_curve
+    x_e, w_e = exp_curve
+    grid, ws, we = _common_grid_interp(x_s, w_s, x_e, w_e, npts)
+    if metric == "l2":
+        return float(np.trapezoid((ws - we) ** 2, grid))
+    if metric == "wasserstein":
+        # 1-Wasserstein between 1-D densities on a shared grid = integral |CDF diff|
+        cdf_s = np.concatenate([[0.0], np.cumsum(0.5 * (ws[1:] + ws[:-1]) * np.diff(grid))])
+        cdf_e = np.concatenate([[0.0], np.cumsum(0.5 * (we[1:] + we[:-1]) * np.diff(grid))])
+        return float(np.trapezoid(np.abs(cdf_s - cdf_e), grid))
+    if metric == "dispersity":
+        # compare Mw/Mn implied by each curve (throws away peak position)
+        def disp(x, w):
+            M = np.power(10.0, x)
+            Mw = float(np.trapezoid(M * w, x))
+            invMn = float(np.trapezoid(w / M, x))
+            return (Mw * invMn) if invMn > 0 else float("nan")
+        d_s = disp(x_s, w_s); d_e = disp(x_e, w_e)
+        return float((math.log(d_s) - math.log(d_e)) ** 2)
+    raise ValueError(f"unknown mmd_metric: {metric}")
+
+
+def collect_curves(exps, coeffs_by_code, numMolecules, K, times) -> dict:
+    """Fan out and return the (replicate-averaged) SIMULATED normalized MMD curve
+    per experiment/time: {code: {t: (grid, w_mean)}}."""
+    fanout = _launch_fanout(exps, coeffs_by_code, numMolecules, K)
+    out = {}
+    for exp in exps:
+        per_t = {}
+        for t in times:
+            rep_curves = []
+            for (r, rd, ok, msg) in fanout[exp.code]:
+                if not ok:
+                    continue
+                p = find_mmd_file(rd, t)
+                if p is None:
+                    continue
+                try:
+                    rep_curves.append(load_norm_curve(p, CONFIG["force_x_col"]))
+                except Exception as ex:
+                    LOG.warning("[mmd] %s rep%d t=%ss curve read failed: %s",
+                                exp.code, r, t, ex)
+            if rep_curves:
+                # average replicate curves on a shared grid spanning all of them
+                lo = min(float(x.min()) for x, _ in rep_curves)
+                hi = max(float(x.max()) for x, _ in rep_curves)
+                grid = np.linspace(lo, hi, int(CONFIG["mmd_grid_points"]))
+                stack = []
+                for x, w in rep_curves:
+                    wi = np.interp(grid, x, w, left=0.0, right=0.0)
+                    a = float(np.trapezoid(wi, grid))
+                    stack.append(wi / a if a > 0 else wi)
+                per_t[int(t)] = (grid, np.mean(stack, axis=0))
+        out[exp.code] = per_t
+    return out
 
 
 # =============================================================================
@@ -720,13 +883,33 @@ def stage2_bounds():
     return [(la, ha), (le, he), (la, ha), (le, he)]
 
 
-def run_stage2(exps, numMolecules: int, K: int, x0=None, evallog=None) -> dict:
+def run_stage2(exps, numMolecules: int, K: int, x0=None, evallog=None, fixed_ki=None) -> dict:
+    """Coupled Arrhenius refinement against Mn(t).
+
+    If `fixed_ki` = {"A_ki":.., "Ea_ki":..} is given (the MMD-determined ki from
+    the stage-ki step), ki is HELD FIXED and only (A_kp, Ea_kp) are optimized —
+    i.e. ki is set BEFORE the Arrhenius constants are fit.  Otherwise all four
+    parameters are optimized (original behaviour, when no MMD data was provided)."""
     if not _HAVE_SCIPY:
         raise RuntimeError("scipy is required for stage2 optimization")
-    bounds = stage2_bounds()
+    la, ha = CONFIG["log10A_bounds"]
+    le, he = CONFIG["Ea_bounds_kJ"]
+
+    if fixed_ki is not None:
+        bounds = [(la, ha), (le, he)]                    # (log10 A_kp, Ea_kp kJ) only
+        def to_params(x):
+            return {"A_ki": fixed_ki["A_ki"], "Ea_ki": fixed_ki["Ea_ki"],
+                    "A_kp": 10.0 ** x[0], "Ea_kp": x[1] * 1000.0}
+        x0r = [x0[2], x0[3]] if x0 is not None else None
+        LOG.info("[stage2] ki HELD FIXED from MMD (A_ki=%.4e, Ea_ki=%.1f kJ); "
+                 "fitting only (A_kp, Ea_kp)", fixed_ki["A_ki"], fixed_ki["Ea_ki"]/1000)
+    else:
+        bounds = [(la, ha), (le, he), (la, ha), (le, he)]
+        to_params = x_to_params
+        x0r = x0
 
     def obj(x):
-        params = x_to_params(x)
+        params = to_params(x)
         total, _, _ = evaluate_params(exps, params, numMolecules, K, "stage2", evallog)
         return total
 
@@ -734,10 +917,9 @@ def run_stage2(exps, numMolecules: int, K: int, x0=None, evallog=None) -> dict:
     LOG.info("[stage2] optimizer=%s  bounds=%s", optimizer, bounds)
 
     if optimizer == "cma":
-        best = _run_cma(obj, bounds, x0)
+        best = _run_cma(obj, bounds, x0r)
     else:
-        # seed the initial DE population around the warm start (if provided)
-        init = _seeded_population(bounds, x0, CONFIG["stage2_popsize"] * 4)
+        init = _seeded_population(bounds, x0r, CONFIG["stage2_popsize"] * 4)
         res = differential_evolution(
             obj, bounds=bounds,
             maxiter=CONFIG["stage2_maxiter"], popsize=CONFIG["stage2_popsize"],
@@ -749,11 +931,12 @@ def run_stage2(exps, numMolecules: int, K: int, x0=None, evallog=None) -> dict:
         )
         best = {"x": list(res.x), "fun": float(res.fun), "nit": int(getattr(res, "nit", -1))}
 
-    params = x_to_params(best["x"])
-    LOG.info("[stage2] BEST loss=%.5g  A_ki=%.4e Ea_ki=%.1f kJ  A_kp=%.4e Ea_kp=%.1f kJ",
+    params = to_params(best["x"])
+    LOG.info("[stage2] BEST loss=%.5g  A_ki=%.4e Ea_ki=%.1f kJ  A_kp=%.4e Ea_kp=%.1f kJ%s",
              best["fun"], params["A_ki"], params["Ea_ki"]/1000,
-             params["A_kp"], params["Ea_kp"]/1000)
-    return {"params": params, "loss": best["fun"], "x": best["x"]}
+             params["A_kp"], params["Ea_kp"]/1000,
+             "  (ki fixed from MMD)" if fixed_ki is not None else "")
+    return {"params": params, "loss": best["fun"], "x": params_to_x(params)}
 
 
 def _seeded_population(bounds, x0, n):
@@ -787,6 +970,153 @@ def _run_cma(obj, bounds, x0):
         es.tell(zs, [obj(denorm(z)) for z in zs])
     z = es.result.xbest
     return {"x": list(denorm(z)), "fun": float(es.result.fbest), "nit": int(es.result.iterations)}
+
+
+# =============================================================================
+# Stage 3 — fit ki from the early-time molar-mass DISTRIBUTION  (--stage-ki)
+# =============================================================================
+def mmd_shape_loss(exps, params: dict, numMolecules: int, K: int,
+                   exp_curves: dict, times) -> tuple:
+    """Fan out at `params`, compare each simulated MMD curve to the provided
+    experimental curve, and reduce to a single (per-experiment-normalized) loss.
+    Optionally adds an Mn term (mmd_mn_weight) so the shape fit can't drift Mn."""
+    avail = [e for e in exps if e.code in exp_curves]
+    coeffs_by_code = {e.code: coeffs_for(e, params) for e in avail}
+    sim_curves = collect_curves(avail, coeffs_by_code, numMolecules, K, times)
+
+    # optional Mn term reuses the already-run MMD files (no extra sims)
+    metric = CONFIG["mmd_metric"]
+    npts = CONFIG["mmd_grid_points"]
+    per_exp = {}
+    failed = False
+    for e in avail:
+        terms = []
+        for t in times:
+            if t not in exp_curves[e.code]:
+                continue
+            sc = sim_curves.get(e.code, {}).get(int(t))
+            if sc is None:
+                failed = True
+                continue
+            d = shape_distance(sc, exp_curves[e.code][t], metric, npts)
+            terms.append(d)
+            if CONFIG["mmd_mn_weight"] > 0 and t in e.Mn_by_time:
+                # Mn implied by the simulated curve vs experimental Mn(t)
+                gx, gw = sc
+                M = np.power(10.0, gx)
+                invMn = float(np.trapezoid(gw / M, gx))
+                if invMn > 0:
+                    mn_sim = 1.0 / invMn
+                    terms.append(CONFIG["mmd_mn_weight"] *
+                                 (math.log(mn_sim) - math.log(e.Mn_by_time[t])) ** 2)
+        per_exp[e.code] = float(np.mean(terms)) if terms else float("nan")
+        if not per_exp[e.code] or not math.isfinite(per_exp[e.code]):
+            failed = True
+
+    if failed or not per_exp:
+        finite = [v for v in per_exp.values() if math.isfinite(v)]
+        return (max(finite) if finite else 0.0) + CONFIG["penalty_loss"], per_exp
+
+    if CONFIG["loss_normalization"] == "per_temperature":
+        by_T = {}
+        for e in avail:
+            by_T.setdefault(e.temperature_C, []).append(per_exp[e.code])
+        total = float(np.mean([np.mean(v) for v in by_T.values()]))
+    else:
+        total = float(np.mean([per_exp[e.code] for e in avail]))
+    return total, per_exp
+
+
+def run_ki_stage(exps, stage1: dict, numMolecules: int, K: int, evallog=None) -> dict:
+    """Determine ki FIRST, from the experimental early-time MMD shape — BEFORE the
+    Arrhenius constants are set (this runs between stage 1 and stage 2).
+
+    For every temperature level that has MMD data we fit ONE effective ki(T) that
+    best reproduces the 10-min distribution shape, holding kp(T) at the stage-1
+    value (kp is well determined by Mn, ki is not).  Then:
+      * >=2 temperatures with MMD  -> A_ki, Ea_ki analytically from the ki(T) points
+      * exactly 1 temperature      -> hold Ea_ki (mmd_fixed_Ea_kJ, default = stage-1
+                                      seed) and back out A_ki from the single ki(T).
+    Returns the MMD-determined ki Arrhenius (A_ki, Ea_ki) + the per-level ki(T),
+    which the orchestration feeds into stage 2 as a FIXED ki."""
+    if not _HAVE_SCIPY:
+        raise RuntimeError("scipy is required for the MMD ki stage")
+    times = [int(t) for t in CONFIG["mmd_fit_times_s"]]
+    exp_curves = load_exp_curves(exps, times)
+    if not exp_curves:
+        LOG.error("[stage-ki] no experimental MMD files under %s/ (pattern %s). Skipping — "
+                  "stage 2 will fit ki from Mn as before.",
+                  CONFIG["exp_mmd_dir"], CONFIG["exp_mmd_pattern"])
+        return {"ki_by_T": {}, "A_ki": None, "Ea_ki": None, "n_used": 0,
+                "codes_used": [], "temps_with_data": []}
+
+    used = sorted(exp_curves.keys())
+    # stage-1 gives us the well-determined effective kp per temperature level
+    kp_by_T = {float(T): lv["kp"] for T, lv in stage1["levels"].items()} if stage1 else {}
+    temps_with = sorted({e.temperature_C for e in exps if e.code in exp_curves})
+    LOG.info("[stage-ki] determining ki FIRST from MMD (%s) at times %s ; temperatures: %s C",
+             used, times, temps_with)
+
+    lo, hi = CONFIG["stage1_k_bounds_log10"]
+    ki_by_T = {}
+    loss_by_T = {}
+    for T in temps_with:
+        exps_here = [e for e in exps if e.temperature_C == T and e.code in exp_curves]
+        kpT = kp_by_T.get(T)
+        if kpT is None:
+            raise RuntimeError(f"[stage-ki] no stage-1 kp for T={T} C (run --stage1 first)")
+
+        def obj(u, exps_here=exps_here, kpT=kpT):
+            ki = 10.0 ** u[0]
+            # hold kp(T) fixed; coeffs_for expects Arrhenius params, so encode k as A, Ea=0
+            params = {"A_ki": ki, "Ea_ki": 0.0, "A_kp": kpT, "Ea_kp": 0.0}
+            loss, _ = mmd_shape_loss(exps_here, params, numMolecules, K, exp_curves, times)
+            LOG.debug("[stage-ki] T=%.0fC ki=%.4g (kp=%.4g) shape_loss=%.5g", T, ki, kpT, loss)
+            return loss
+
+        res = differential_evolution(
+            obj, bounds=[(lo, hi)],
+            maxiter=CONFIG["mmd_ki_maxiter"], popsize=CONFIG["mmd_ki_popsize"],
+            tol=CONFIG["mmd_ki_tol"], seed=CONFIG["seed"], polish=False,
+            updating="deferred")
+        ki_by_T[T] = 10.0 ** res.x[0]
+        loss_by_T[T] = float(res.fun)
+        LOG.info("[stage-ki] T=%.0f C -> ki(MMD)=%.5g  (shape_loss=%.4g, kp held=%.5g)",
+                 T, ki_by_T[T], loss_by_T[T], kpT)
+
+    # turn the MMD-determined ki(T) points into ki's Arrhenius parameters
+    R = CONFIG["R"]
+    if len(temps_with) >= 2:
+        Tlo, Thi = temps_with[0], temps_with[-1]
+        inv = 1.0 / T_K(Tlo) - 1.0 / T_K(Thi)
+        Ea_ki = R * math.log(ki_by_T[Thi] / ki_by_T[Tlo]) / inv
+        A_ki = ki_by_T[Thi] * math.exp(Ea_ki / (R * T_K(Thi)))
+        LOG.info("[stage-ki] ki Arrhenius from MMD points: A_ki=%.4e  Ea_ki=%.1f kJ/mol",
+                 A_ki, Ea_ki / 1000)
+        Ea_hi = CONFIG["Ea_bounds_kJ"][1] * 1000.0
+        if Ea_ki < 0 or Ea_ki > Ea_hi:
+            LOG.warning("[stage-ki] Ea_ki=%.1f kJ/mol is outside [0, %.0f] — the two "
+                        "MMD-derived ki(%.0fC)=%.4g and ki(%.0fC)=%.4g don't follow a physical "
+                        "Arrhenius trend (likely noise in ki(T)). Treat ki's temperature "
+                        "dependence with caution; more MMD replicates or a 3rd temperature helps.",
+                        Ea_ki / 1000, Ea_hi / 1000, Tlo, ki_by_T[Tlo], Thi, ki_by_T[Thi])
+    else:
+        T = temps_with[0]
+        Ea_kJ = CONFIG["mmd_fixed_Ea_kJ"]
+        if Ea_kJ is None and stage1 is not None:
+            Ea_kJ = stage1["arrhenius_seed"]["Ea_ki"] / 1000.0
+        if Ea_kJ is None:
+            Ea_kJ = 0.0
+        Ea_ki = float(Ea_kJ) * 1000.0
+        A_ki = ki_by_T[T] * math.exp(Ea_ki / (R * T_K(T)))
+        LOG.warning("[stage-ki] only ONE temperature has MMD data -> Ea_ki NOT identifiable; "
+                    "held at %.1f kJ/mol, ki(%.0fC)=%.4g -> A_ki back-solved (%.4e).",
+                    Ea_kJ, T, ki_by_T[T], A_ki)
+
+    return {"ki_by_T": {str(T): ki_by_T[T] for T in temps_with},
+            "loss_by_T": {str(T): loss_by_T[T] for T in temps_with},
+            "A_ki": A_ki, "Ea_ki": Ea_ki, "n_used": len(used),
+            "codes_used": used, "temps_with_data": temps_with}
 
 
 # =============================================================================
@@ -980,7 +1310,48 @@ def make_plots(exps, results, params, stage1, out_dir: Path):
     return paths
 
 
-def write_report(exps, params, stage1, screen, verify, out_dir: Path, run_dir: Path):
+def make_mmd_plot(exps, params, out_dir: Path):
+    """Overlay simulated vs experimental normalized MMD curves at the MMD fit
+    times, for every experiment that has a provided experimental curve."""
+    if not _HAVE_MPL or params is None:
+        return None
+    times = [int(t) for t in CONFIG["mmd_fit_times_s"]]
+    exp_curves = load_exp_curves(exps, times)
+    if not exp_curves:
+        return None
+    used = [e for e in exps if e.code in exp_curves]
+    coeffs_by_code = {e.code: coeffs_for(e, params) for e in used}
+    sim_curves = collect_curves(used, coeffs_by_code, CONFIG["numMolecules_fit"],
+                                CONFIG["K_replicates_fit"], times)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n = len(used)
+    ncol = min(3, n)
+    nrow = int(math.ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 3.2 * nrow), squeeze=False)
+    for i, e in enumerate(used):
+        ax = axes[i // ncol][i % ncol]
+        for t in times:
+            if t in exp_curves[e.code]:
+                xe, we = exp_curves[e.code][t]
+                ax.plot(xe, we / max(np.trapezoid(we, xe), 1e-30), "k-", label=f"exp {t}s")
+            sc = sim_curves.get(e.code, {}).get(t)
+            if sc is not None:
+                xs, ws = sc
+                ax.plot(xs, ws, "C0--", label=f"sim {t}s")
+        ax.set_title(f"{e.code} ({e.temperature_C:.0f} °C)")
+        ax.set_xlabel("log10 M"); ax.set_ylabel("dw/dlog10 M (norm.)")
+        ax.legend(fontsize=7)
+    for j in range(n, nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+    fig.tight_layout()
+    p = out_dir / "mmd_overlays.png"
+    fig.savefig(p, dpi=120); plt.close(fig)
+    LOG.info("[plots] wrote MMD overlay %s", p)
+    return p
+
+
+def write_report(exps, params, stage1, screen, verify, out_dir: Path, run_dir: Path,
+                 ki_stage=None):
     temps = temperatures(exps)
     # implied k at each temperature
     k_at_T = {}
@@ -1047,19 +1418,52 @@ def write_report(exps, params, stage1, screen, verify, out_dir: Path, run_dir: P
                      f"→ ki only shifts the earliest Mn.")
         ki_slope = abs(sk["ki"]["d_lnMn_d_lnk_earliest"])
         nf = screen["noise_floor_rel"]
-        if math.isfinite(ki_slope) and ki_slope > 0 and math.isfinite(nf):
+        if math.isfinite(ki_slope) and ki_slope > 1e-6 and math.isfinite(nf):
             resolvable = nf / ki_slope
-            lines.append(f"- Practical ki resolution: a change in ki is only resolvable if it moves "
-                         f"the 10-min Mn by more than the ~{nf:.2%} noise floor, i.e. |Δln ki| ≳ "
-                         f"**{resolvable:.2f}** (≈ ×{math.exp(resolvable):.2f}). Below the transient "
-                         f"threshold ki is effectively unidentified.\n")
+            if resolvable > 20:   # exp() would overflow / is physically "unbounded"
+                lines.append(f"- Practical ki resolution: the 10-min Mn barely responds to ki "
+                             f"(slope {ki_slope:.2g} ≲ noise floor {nf:.2%}), so **ki is effectively "
+                             f"unidentified from Mn alone** — the MMD stage below is the way to pin it.\n")
+            else:
+                lines.append(f"- Practical ki resolution: a change in ki is only resolvable if it moves "
+                             f"the 10-min Mn by more than the ~{nf:.2%} noise floor, i.e. |Δln ki| ≳ "
+                             f"**{resolvable:.2f}** (≈ ×{math.exp(resolvable):.2f}). Below the transient "
+                             f"threshold ki is effectively unidentified.\n")
+        else:
+            lines.append(f"- The 10-min Mn shows no resolvable ki sensitivity → **ki is unidentified "
+                         f"from Mn alone**; use the MMD stage to determine it.\n")
     else:
         lines.append("_Run --screen to quantify ki/kp sensitivity and the noise floor._\n")
     lines.append("**Recommendation:** with Mn-only data ki is weakly identified (early-time "
-                 "transient only). If a dispersity (Đ = Mw/Mn) or Mw time series is available, "
-                 "add it as a second observable (hook already present: set "
-                 "`use_dispersity_term=True`, `dispersity_weight>0`, and add an `exp_D` column) — "
-                 "Đ carries the initiation-broadening signal and strongly constrains ki.\n")
+                 "transient only). The MMD stage below (`--stage-ki`) resolves this directly from "
+                 "the early-time distribution *shape*; a dispersity (Đ = Mw/Mn) or Mw time series "
+                 "is an alternative second observable (hook: `use_dispersity_term=True`, "
+                 "`dispersity_weight>0`, add an `exp_D` column).\n")
+
+    if ki_stage is not None and ki_stage.get("n_used", 0) > 0:
+        lines.append("## Stage 1.5 — ki determined from the early-time MMD (before Arrhenius)\n")
+        lines.append(f"**ki is pinned first**, from the experimental 10-min distribution *shape* "
+                     f"(`{CONFIG['mmd_metric']}` distance at t={CONFIG['mmd_fit_times_s']} s), "
+                     f"holding kp(T) at the stage-1 value — *then* the Arrhenius constants are set "
+                     f"(stage 2 fits only kp, with ki held fixed). Experiments used: "
+                     f"{', '.join(ki_stage['codes_used'])}.\n")
+        lines.append("| T (°C) | ki(MMD) | kp(stage-1, held) | shape loss |")
+        lines.append("|---|---|---|---|")
+        for T in ki_stage["temps_with_data"]:
+            kiT = ki_stage["ki_by_T"][str(T)]
+            kpT = (stage1["levels"][str(T)]["kp"] if stage1 else float("nan"))
+            lossT = ki_stage["loss_by_T"][str(T)]
+            lines.append(f"| {T:.0f} | {kiT:.5g} | {kpT:.5g} | {lossT:.4g} |")
+        lines.append(f"\n→ ki Arrhenius from these points: **A_ki = {ki_stage['A_ki']:.4e}**, "
+                     f"**Ea_ki = {ki_stage['Ea_ki']/1000:.2f} kJ/mol** (carried into stage 2 as a "
+                     f"FIXED ki).")
+        if len(ki_stage["temps_with_data"]) < 2:
+            lines.append(f"\n> ⚠️ Only one temperature had MMD data, so **Ea_ki is not identifiable** "
+                         f"from the shape alone — it was held at "
+                         f"{CONFIG['mmd_fixed_Ea_kJ'] if CONFIG['mmd_fixed_Ea_kJ'] is not None else 'the stage-1 seed value'} "
+                         f"and only ki(T) (hence A_ki) was determined. Provide a 10-min MMD at the "
+                         f"other temperature to identify Ea_ki too.")
+        lines.append("\nSee `plots/mmd_overlays.png` for the sim-vs-exp distribution overlays.\n")
 
     if verify is not None:
         lines.append("## Verification (high-resolution replicates)\n")
@@ -1171,6 +1575,25 @@ def load_latest_best_params():
     return None
 
 
+def load_latest_fixed_ki():
+    """Read the MMD-determined ki (A_ki, Ea_ki) from the most recent stage_ki.json
+    so a separate `--stage2` invocation still holds ki fixed at what the MMD stage
+    found."""
+    root = Path(CONFIG["repo_dir"]) / CONFIG["results_root"]
+    if not root.exists():
+        return None
+    for d in sorted(root.iterdir(), reverse=True):
+        p = d / "stage_ki.json"
+        if p.exists():
+            try:
+                j = json.loads(p.read_text())
+                if j.get("A_ki") is not None:
+                    return {"A_ki": float(j["A_ki"]), "Ea_ki": float(j["Ea_ki"])}
+            except Exception:
+                continue
+    return None
+
+
 def default_params_from_model() -> dict:
     """Fallback theta from the model file's nominal ki=0.25, kp=0.20 at the mean T.
     Uses Ea=0 so k(T)=A=nominal — a neutral starting point when no stage1 exists."""
@@ -1196,12 +1619,14 @@ def build_argparser():
                     help="decoupled per-temperature k warm start + Arrhenius seed")
     ap.add_argument("--stage2", action="store_true",
                     help="coupled global Arrhenius refinement")
+    ap.add_argument("--stage-ki", dest="stage_ki", action="store_true",
+                    help="determine ki from the 10-min MMD shape (runs between stage1 & stage2)")
     ap.add_argument("--verify", action="store_true",
                     help="re-run best fit K times at verification resolution")
     ap.add_argument("--report", action="store_true",
                     help="(re)write report.md + plots from the latest results")
     ap.add_argument("--all", action="store_true",
-                    help="setup -> stage1 -> stage2 -> verify -> report")
+                    help="setup -> stage1 -> stage-ki -> screen -> stage2 -> verify -> report")
     ap.add_argument("--numMolecules", type=float, default=None,
                     help="override fitting numMolecules for this run")
     ap.add_argument("--reps", type=int, default=None,
@@ -1248,7 +1673,8 @@ def main(argv=None):
 
     # nothing selected -> show help
     if not any([args.setup, args.single, args.eval_once, args.screen,
-                args.stage1, args.stage2, args.verify, args.report, args.all]):
+                args.stage1, args.stage2, args.stage_ki, args.verify,
+                args.report, args.all]):
         build_argparser().print_help()
         return 0
 
@@ -1285,6 +1711,28 @@ def main(argv=None):
     else:
         stage1 = load_latest_stage1()
 
+    # ---- stage-ki: determine ki FIRST from the MMD (between stage 1 & 2) -----
+    # ki is pinned from the early-time distribution shape BEFORE the Arrhenius
+    # constants are fit; stage 2 then holds ki fixed and fits only kp.
+    ki_stage = None
+    fixed_ki = None
+    if args.stage_ki or args.all:
+        if stage1 is None:
+            LOG.error("[stage-ki] needs stage 1 for kp(T). Run --stage1 first (or --all).")
+        else:
+            ki_stage = run_ki_stage(exps, stage1, nMol_fit, K_fit, evallog)
+            if ki_stage.get("A_ki") is not None:
+                fixed_ki = {"A_ki": ki_stage["A_ki"], "Ea_ki": ki_stage["Ea_ki"]}
+                # fold the MMD-determined ki into the running best/seed
+                if best is None:
+                    best = dict(stage1["arrhenius_seed"])
+                best = dict(best); best["A_ki"] = fixed_ki["A_ki"]; best["Ea_ki"] = fixed_ki["Ea_ki"]
+                (run_dir / "stage_ki.json").write_text(json.dumps(ki_stage, indent=2, default=str))
+            did_something = True
+    # persist the fixed-ki across separate invocations (e.g. --stage-ki then --stage2)
+    if fixed_ki is None:
+        fixed_ki = load_latest_fixed_ki()
+
     # ---- one fixed-theta fan-out -------------------------------------------
     if args.eval_once:
         params = best or load_latest_best_params() or (
@@ -1308,7 +1756,7 @@ def main(argv=None):
         seed_params = best or (stage1["arrhenius_seed"] if stage1 else None) \
             or load_latest_best_params()
         x0 = params_to_x(seed_params) if seed_params else None
-        st2 = run_stage2(exps, nMol_fit, K_fit, x0=x0, evallog=evallog)
+        st2 = run_stage2(exps, nMol_fit, K_fit, x0=x0, evallog=evallog, fixed_ki=fixed_ki)
         best = st2["params"]
         # one clean evaluation at the optimum to capture per-exp breakdown + Mn
         total, last_breakdown, last_results = evaluate_params(
@@ -1332,7 +1780,7 @@ def main(argv=None):
             did_something = True
 
     # ---- report + plots -----------------------------------------------------
-    if args.report or args.all or args.stage2 or args.verify or args.eval_once:
+    if args.report or args.all or args.stage2 or args.stage_ki or args.verify or args.eval_once:
         if best is None:
             best = load_latest_best_params()
         if last_results is None and best is not None:
@@ -1340,7 +1788,8 @@ def main(argv=None):
                 exps, best, nMol_fit, K_fit, "report_eval", evallog)
         if last_results is not None:
             make_plots(exps, last_results, best, stage1, run_dir / "plots")
-            write_report(exps, best, stage1, screen, verify, run_dir, run_dir)
+            make_mmd_plot(exps, best, run_dir / "plots")
+            write_report(exps, best, stage1, screen, verify, run_dir, run_dir, ki_stage=ki_stage)
             save_best_params(best, last_breakdown, run_dir)
         else:
             LOG.warning("[report] no simulation results available to plot/report")
