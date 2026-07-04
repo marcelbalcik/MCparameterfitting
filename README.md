@@ -45,10 +45,48 @@ python main.py --single TW60      # 2. run ONE folder once → prints Mn(t) (smo
 python main.py --eval-once        # 3. one parallel fan-out for a fixed θ → single global loss
 python main.py --screen           # 4. ki/kp sensitivity + stochastic noise floor
 python main.py --stage1           # 5. per-temperature effective-k warm start + Arrhenius seed
-python main.py --stage2           # 6. coupled global (A,Ea) refinement (warm-started from stage1)
-python main.py --verify           # 7. re-run best fit K× at high numMolecules
-python main.py --all              # setup → stage1 → screen → stage2 → verify → report
+python main.py --stage-ki         # 6. determine ki from the 10-min MMD shape (BETWEEN stage1 & stage2)
+python main.py --stage2           # 7. coupled Arrhenius refinement (holds ki fixed if stage-ki ran)
+python main.py --verify           # 8. re-run best fit K× at high numMolecules
+python main.py --all              # setup → stage1 → stage-ki → screen → stage2 → verify → report
 ```
+
+### Stage-ki — determine `ki` FIRST, from the early-time molar-mass distribution
+
+`kp` is well constrained by `Mn(t)`, but `ki` is not — it only shifts the earliest
+point. So **`ki` is pinned before the Arrhenius constants are set**: this stage
+runs *between* stage 1 and stage 2 and fits an effective **`ki(T)` per temperature**
+against the 10-min **distribution shape** (peak position + breadth, which carries
+the initiation-broadening signal), **holding `kp(T)` at the stage-1 value**. Stage 2
+then sets the Arrhenius constants with **`ki` held fixed**, fitting only
+`(A_kp, Ea_kp)` against `Mn(t)`. This cleanly decouples the two observables:
+`kp` from Mn(t), `ki` from the early-time shape.
+
+**To use it, drop your experimental MMD file(s) here:**
+
+```
+exp_mmd/TW60_MMD-600.dat        # two columns: log10(M)   dw/dlog10(M)   (same format as the sim output)
+exp_mmd/TW56_MMD-600.dat        # 600 = 10 min; one file per experiment you have data for
+...
+```
+
+Filename pattern and folder are config (`exp_mmd_pattern`, `exp_mmd_dir`). Any
+experiment without a file is silently skipped, so you can start with just one.
+**Identifiability of `Ea_ki`:** with MMDs at **both** temperatures the two `ki(T)`
+points give `A_ki, Ea_ki` analytically; with only **one** temperature it determines
+`ki(T)` there and holds `Ea_ki` (config `mmd_fixed_Ea_kJ`, default = the stage-1
+seed), warning that `Ea_ki` isn't identifiable from one temperature. Distance
+metric is config `mmd_metric` (`l2` default, or `wasserstein` / `dispersity`).
+If **no** MMD file is present, stage-ki is skipped and stage 2 fits all four
+parameters from `Mn(t)` as before (fully backward compatible). Output:
+`ki` pinned in `best_params.*`, `stage_ki.json` (with the per-temperature
+`ki(T)`), and `plots/mmd_overlays.png` (sim vs exp curves).
+
+> M-axis consistency: because `n_I,eff` is derived from the SEC `Mn(720)`, the
+> simulation's absolute molar-mass axis is tied to the **same SEC calibration** as
+> your experimental curve, so comparing them on `log10(M)` is meaningful. If your
+> SEC axis is only relative / PS-equivalent, prefer `mmd_metric="dispersity"` or
+> `"wasserstein"` (less sensitive to an absolute peak-position offset).
 
 Before wiring the optimizer, validate the driver alone:
 `cd work/TW60 && python TWXX.py` (uses the folder's JSONs) should produce
