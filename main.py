@@ -170,9 +170,11 @@ CONFIG = {
     "subprocess_timeout_s": 7200,             # per driver run
 
     # ---- Stage 1: decoupled per-temperature k fit ---------------------------
+    # Worst-case sim evaluations per temperature level = (maxiter+1)*popsize*2
+    # (2-D: ki,kp). (14+1)*6*2 = 180 (< 200); it usually stops earlier via tol.
     "stage1_k_bounds_log10": [-6.0, 3.0],     # bounds on log10(k) [L/(mol s)] per coefficient
-    "stage1_maxiter":        30,
-    "stage1_popsize":        12,
+    "stage1_maxiter":        14,
+    "stage1_popsize":        6,
     "stage1_tol":            1e-3,
 
     # ---- Stage 2: coupled global Arrhenius fit ------------------------------
