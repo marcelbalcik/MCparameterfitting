@@ -45,17 +45,49 @@ python main.py --single TW60      # 2. run ONE folder once → prints Mn(t) (smo
 python main.py --eval-once        # 3. one parallel fan-out for a fixed θ → single global loss
 python main.py --screen           # 4. ki/kp sensitivity + stochastic noise floor
 python main.py --stage1           # 5. per-temperature effective-k warm start + Arrhenius seed
-python main.py --stage-ki         # 6. (optional) determine ki from the 10-min MMD shape (BETWEEN stage1 & stage2)
-python main.py --stage2           # 7. coupled Arrhenius refinement (holds ki fixed if stage-ki ran)
+python main.py --stage-ki         # 6a. (optional) determine ki from the 10-min MMD shape
+python main.py --stage-ki-mw      # 6b. (optional) determine ki from experimental Mw in the CSV
+python main.py --stage2           # 7. coupled Arrhenius refinement (holds ki fixed if a ki stage ran)
 python main.py --verify           # 8. re-run best fit K× at high numMolecules
 python main.py --all              # setup → stage1 → screen → stage2 → verify → report   (NO ki stage)
-python main.py --all-ki           # same as --all but WITH the MMD ki stage (stage1 → stage-ki → …)
+python main.py --all-ki           # same as --all but WITH the MMD ki stage
+python main.py --all-ki-mw        # same as --all but WITH the Mw ki stage (CSV exp_Mw)
 ```
 
-**The MMD `ki` stage is opt-in.** Plain `--all` does *not* run it (and ignores any
-leftover `stage_ki.json`) — it fits all four parameters from `Mn(t)`. Use
-`--all-ki` to include the ki stage, or run `--stage-ki` explicitly (a later bare
-`--stage2` then continues to hold that `ki` fixed).
+**Both `ki` stages are opt-in and mutually alternative.** Plain `--all` runs
+*neither* (and ignores any leftover `stage_ki.json`) — it fits all four parameters
+from `Mn(t)`. Pick one:
+- `--all-ki` / `--stage-ki` → determine `ki` from the 10-min **MMD shape** (needs `exp_mmd/` curve files).
+- `--all-ki-mw` / `--stage-ki-mw` → determine `ki` from experimental **Mw** in the CSV (needs an `exp_Mw` column).
+
+Either runs between stage 1 and stage 2 and pins `ki` (per temperature, holding
+stage-1's `kp`) *before* stage 2 sets the Arrhenius constants with `ki` held
+fixed. A later bare `--stage2` continues to hold whichever `ki` the stage found.
+If you request both in one run, the MMD (richer) result wins.
+
+### `--stage-ki-mw` — determine `ki` from Mw in the CSV
+
+When you have `Mw` but not full curves, add an **`exp_Mw`** column (g/mol) to
+`experimental_data.csv` on the fit rows (at least the 10-min row):
+
+```
+code,temperature_C,...,time_s,Mn,...,exp_Mw
+TW60,30,...,600,7484,...,8100
+TW60,30,...,1200,12359,...,13050
+...
+```
+
+The stage fits an effective `ki(T)` per temperature so simulated `Mw` matches the
+CSV, holding `kp(T)` from stage 1, then turns the `ki(T)` points into `A_ki, Ea_ki`
+(needs both temperatures for `Ea_ki`; one temperature holds `Ea_ki`). Config:
+`mw_ki_times_s` (default `[600]` = 10 min), `mw_metric` (`"mw"` default, or
+`"dispersity"` to fit `Đ = Mw/Mn`, which cancels the absolute-scale part),
+`mw_fixed_Ea_kJ`, and `mw_ki_*` optimizer settings.
+
+> **SEC caveat (both breadth-based methods):** instrumental band-broadening inflates
+> measured `Mw`/`Đ` while the raw kMC distribution has none, so a raw comparison
+> biases `ki` **low**. Treat the result as a practical estimate; `mw_metric="dispersity"`
+> and/or more temperatures mitigate it. Flagged in the log and report.
 
 ### Stage-ki — determine `ki` FIRST, from the early-time molar-mass distribution
 

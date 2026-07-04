@@ -12,11 +12,13 @@ Run it on the workstation where the mcPolymer engine lives:
     python main.py --eval-once      # one parallel fan-out for a fixed theta -> global loss
     python main.py --screen         # ki/kp sensitivity + stochastic noise floor
     python main.py --stage1         # decoupled per-temperature k warm start + Arrhenius seed
-    python main.py --stage-ki       # determine ki from the 10-min MMD shape (BETWEEN stage1 & stage2)
-    python main.py --stage2         # coupled Arrhenius refinement (holds ki fixed if stage-ki ran)
+    python main.py --stage-ki       # (opt-in) determine ki from the 10-min MMD shape (stage1 < here < stage2)
+    python main.py --stage-ki-mw    # (opt-in) determine ki from experimental Mw in the CSV (exp_Mw column)
+    python main.py --stage2         # coupled Arrhenius refinement (holds ki fixed if a ki stage ran)
     python main.py --verify         # re-run best fit K times at verification resolution
     python main.py --all            # setup -> stage1 -> screen -> stage2 -> verify -> report  (NO ki stage)
-    python main.py --all-ki         # same as --all but WITH the MMD ki stage (stage1 -> stage-ki -> ...)
+    python main.py --all-ki         # same as --all but WITH the MMD ki stage
+    python main.py --all-ki-mw      # same as --all but WITH the Mw ki stage (CSV exp_Mw)
     python main.py --report         # (re)write report.md + plots from the latest results
 
 The stages are deliberately independent so each can be validated on its own
@@ -213,6 +215,18 @@ CONFIG = {
     "mmd_ki_popsize":        12,
     "mmd_ki_tol":            1e-2,
 
+    # ---- Stage-ki (Mw): fit ki from experimental Mw in the CSV ----------------
+    # ALTERNATIVE to the MMD stage when you have Mw but not full curves. Add an
+    # `exp_Mw` column (g/mol) to experimental_data.csv on the fit rows; this stage
+    # determines ki(T) per temperature so simulated Mw matches, holding kp(T) at
+    # the stage-1 value, then ki(T) -> Arrhenius (fed to stage 2 as a fixed ki).
+    "mw_ki_times_s":         [600],            # which times' Mw to use (10 min carries the ki signal)
+    "mw_metric":             "mw",             # "mw" (fit Mw) | "dispersity" (fit Đ=Mw/Mn, scale-free)
+    "mw_fixed_Ea_kJ":        None,             # 1-temperature fallback (None -> stage-1 seed Ea_ki)
+    "mw_ki_maxiter":         20,
+    "mw_ki_popsize":         8,
+    "mw_ki_tol":             1e-2,
+
     # ---- reproducibility -----------------------------------------------------
     "seed":                  20260704,
 
@@ -275,7 +289,8 @@ class Experiment:
     def __init__(self, code: str, temperature_C: float, n_styrene_mol: float,
                  n_sbuli_charged_mol: float, n_cyclohexane_mol: float,
                  n_sbuli_eff_mol: float, fit_times_s, Mn_by_time: dict,
-                 Mn720: float, D_by_time: dict | None = None):
+                 Mn720: float, D_by_time: dict | None = None,
+                 Mw_by_time: dict | None = None):
         self.code = code
         self.temperature_C = float(temperature_C)
         self.n_styrene_mol = float(n_styrene_mol)
@@ -286,6 +301,7 @@ class Experiment:
         self.Mn_by_time = {int(t): float(v) for t, v in Mn_by_time.items()}
         self.Mn720 = float(Mn720)
         self.D_by_time = D_by_time or {}
+        self.Mw_by_time = Mw_by_time or {}   # experimental Mw(t) from the CSV `exp_Mw` column
 
     @property
     def titer_ratio(self) -> float:
@@ -320,6 +336,10 @@ def load_experiments(csv_path: Path):
         if "exp_D" in df.columns:
             D_by_time = {int(t): float(d) for t, d in zip(fit_rows["time_s"], fit_rows["exp_D"])
                          if pd.notna(d)}
+        Mw_by_time = {}
+        if "exp_Mw" in df.columns:
+            Mw_by_time = {int(t): float(w) for t, w in zip(fit_rows["time_s"], fit_rows["exp_Mw"])
+                          if pd.notna(w)}
         r0 = g.iloc[0]
         exp = Experiment(
             code=str(code),
@@ -332,6 +352,7 @@ def load_experiments(csv_path: Path):
             Mn_by_time=Mn_by_time,
             Mn720=Mn720,
             D_by_time=D_by_time,
+            Mw_by_time=Mw_by_time,
         )
         # sanity: consistent effective-initiator definition
         chk = exp.n_eff_check()
@@ -902,7 +923,7 @@ def run_stage2(exps, numMolecules: int, K: int, x0=None, evallog=None, fixed_ki=
             return {"A_ki": fixed_ki["A_ki"], "Ea_ki": fixed_ki["Ea_ki"],
                     "A_kp": 10.0 ** x[0], "Ea_kp": x[1] * 1000.0}
         x0r = [x0[2], x0[3]] if x0 is not None else None
-        LOG.info("[stage2] ki HELD FIXED from MMD (A_ki=%.4e, Ea_ki=%.1f kJ); "
+        LOG.info("[stage2] ki HELD FIXED from the ki stage (A_ki=%.4e, Ea_ki=%.1f kJ); "
                  "fitting only (A_kp, Ea_kp)", fixed_ki["A_ki"], fixed_ki["Ea_ki"]/1000)
     else:
         bounds = [(la, ha), (le, he), (la, ha), (le, he)]
@@ -936,7 +957,7 @@ def run_stage2(exps, numMolecules: int, K: int, x0=None, evallog=None, fixed_ki=
     LOG.info("[stage2] BEST loss=%.5g  A_ki=%.4e Ea_ki=%.1f kJ  A_kp=%.4e Ea_kp=%.1f kJ%s",
              best["fun"], params["A_ki"], params["Ea_ki"]/1000,
              params["A_kp"], params["Ea_kp"]/1000,
-             "  (ki fixed from MMD)" if fixed_ki is not None else "")
+             "  (ki fixed from the ki stage)" if fixed_ki is not None else "")
     return {"params": params, "loss": best["fun"], "x": params_to_x(params)}
 
 
@@ -1085,36 +1106,156 @@ def run_ki_stage(exps, stage1: dict, numMolecules: int, K: int, evallog=None) ->
         LOG.info("[stage-ki] T=%.0f C -> ki(MMD)=%.5g  (shape_loss=%.4g, kp held=%.5g)",
                  T, ki_by_T[T], loss_by_T[T], kpT)
 
-    # turn the MMD-determined ki(T) points into ki's Arrhenius parameters
+    A_ki, Ea_ki = _ki_points_to_arrhenius(ki_by_T, temps_with, stage1,
+                                          CONFIG["mmd_fixed_Ea_kJ"], tag="stage-ki")
+    return {"method": "MMD-shape", "metric": CONFIG["mmd_metric"], "times_s": times,
+            "ki_by_T": {str(T): ki_by_T[T] for T in temps_with},
+            "loss_by_T": {str(T): loss_by_T[T] for T in temps_with},
+            "A_ki": A_ki, "Ea_ki": Ea_ki, "n_used": len(used),
+            "codes_used": used, "temps_with_data": temps_with}
+
+
+def _ki_points_to_arrhenius(ki_by_T, temps_with, stage1, fixed_Ea_kJ, tag):
+    """Turn per-temperature ki(T) points into ki's Arrhenius (A_ki, Ea_ki).
+    >=2 temperatures -> exact analytic; 1 temperature -> hold Ea_ki and back-solve
+    A_ki (Ea_ki not identifiable from one temperature).  Shared by every ki stage."""
     R = CONFIG["R"]
     if len(temps_with) >= 2:
         Tlo, Thi = temps_with[0], temps_with[-1]
         inv = 1.0 / T_K(Tlo) - 1.0 / T_K(Thi)
         Ea_ki = R * math.log(ki_by_T[Thi] / ki_by_T[Tlo]) / inv
         A_ki = ki_by_T[Thi] * math.exp(Ea_ki / (R * T_K(Thi)))
-        LOG.info("[stage-ki] ki Arrhenius from MMD points: A_ki=%.4e  Ea_ki=%.1f kJ/mol",
-                 A_ki, Ea_ki / 1000)
+        LOG.info("[%s] ki Arrhenius from ki(T) points: A_ki=%.4e  Ea_ki=%.1f kJ/mol",
+                 tag, A_ki, Ea_ki / 1000)
         Ea_hi = CONFIG["Ea_bounds_kJ"][1] * 1000.0
         if Ea_ki < 0 or Ea_ki > Ea_hi:
-            LOG.warning("[stage-ki] Ea_ki=%.1f kJ/mol is outside [0, %.0f] — the two "
-                        "MMD-derived ki(%.0fC)=%.4g and ki(%.0fC)=%.4g don't follow a physical "
-                        "Arrhenius trend (likely noise in ki(T)). Treat ki's temperature "
-                        "dependence with caution; more MMD replicates or a 3rd temperature helps.",
-                        Ea_ki / 1000, Ea_hi / 1000, Tlo, ki_by_T[Tlo], Thi, ki_by_T[Thi])
+            LOG.warning("[%s] Ea_ki=%.1f kJ/mol is outside [0, %.0f] — the two ki(%.0fC)=%.4g "
+                        "and ki(%.0fC)=%.4g don't follow a physical Arrhenius trend (likely noise "
+                        "in ki(T)). Treat ki's temperature dependence with caution; more "
+                        "replicates or a 3rd temperature helps.",
+                        tag, Ea_ki / 1000, Ea_hi / 1000, Tlo, ki_by_T[Tlo], Thi, ki_by_T[Thi])
     else:
         T = temps_with[0]
-        Ea_kJ = CONFIG["mmd_fixed_Ea_kJ"]
+        Ea_kJ = fixed_Ea_kJ
         if Ea_kJ is None and stage1 is not None:
             Ea_kJ = stage1["arrhenius_seed"]["Ea_ki"] / 1000.0
         if Ea_kJ is None:
             Ea_kJ = 0.0
         Ea_ki = float(Ea_kJ) * 1000.0
         A_ki = ki_by_T[T] * math.exp(Ea_ki / (R * T_K(T)))
-        LOG.warning("[stage-ki] only ONE temperature has MMD data -> Ea_ki NOT identifiable; "
-                    "held at %.1f kJ/mol, ki(%.0fC)=%.4g -> A_ki back-solved (%.4e).",
-                    Ea_kJ, T, ki_by_T[T], A_ki)
+        LOG.warning("[%s] only ONE temperature has data -> Ea_ki NOT identifiable; held at "
+                    "%.1f kJ/mol, ki(%.0fC)=%.4g -> A_ki back-solved (%.4e).",
+                    tag, Ea_kJ, T, ki_by_T[T], A_ki)
+    return A_ki, Ea_ki
 
-    return {"ki_by_T": {str(T): ki_by_T[T] for T in temps_with},
+
+# =============================================================================
+# Stage-ki (Mw) — determine ki from experimental Mw fed in the CSV  (--stage-ki-mw)
+# =============================================================================
+# Alternative to the MMD-shape stage when you have Mw (not full curves).  Since
+# n_I,eff fixes the chain count and kp(T) is held at the stage-1 value, the ONLY
+# free lever left in Mw(early time) is the distribution breadth — i.e. ki.  Same
+# structure: fit ki(T) per temperature, then ki(T) -> Arrhenius, fed to stage 2
+# as a fixed ki.  Provide Mw in the CSV as an `exp_Mw` column (g/mol) on the
+# 10-min (and optionally 20/40/60-min) rows.  Optionally uses Đ = Mw/Mn instead
+# of Mw (config mw_metric="dispersity"), which cancels the absolute-scale part.
+#
+# SEC caveat: instrumental band-broadening inflates measured Mw/Đ but the raw kMC
+# distribution has none, so raw-sim vs exp comparison biases ki LOW.  Flagged in
+# the log/report; use mw_metric="dispersity" or more temperatures to mitigate.
+
+def mw_target(exp, t, metric):
+    """Experimental target for the Mw stage: Mw (g/mol) or Đ = Mw/Mn."""
+    Mw = exp.Mw_by_time.get(int(t))
+    if Mw is None:
+        return None
+    if metric == "dispersity":
+        Mn = exp.Mn_by_time.get(int(t))
+        return (Mw / Mn) if (Mn and Mn > 0) else None
+    return Mw
+
+
+def mw_loss(exps_here, params, numMolecules, K, times, metric):
+    """Fan out at params; compare simulated Mw (or Đ) to the CSV targets."""
+    coeffs_by_code = {e.code: coeffs_for(e, params) for e in exps_here}
+    results = run_all(exps_here, coeffs_by_code, numMolecules, K)
+    per_exp = {}
+    failed = False
+    for e in exps_here:
+        terms = []
+        pt = results[e.code]["per_time"]
+        for t in times:
+            tgt = mw_target(e, t, metric)
+            if tgt is None or t not in pt:
+                continue
+            sim = pt[t]["D"] if metric == "dispersity" else pt[t]["Mw"]
+            if sim <= 0:
+                failed = True
+                continue
+            terms.append((math.log(sim) - math.log(tgt)) ** 2)
+        per_exp[e.code] = float(np.mean(terms)) if terms else float("nan")
+        if not per_exp[e.code] or not math.isfinite(per_exp[e.code]):
+            failed = True
+    if failed or not per_exp:
+        finite = [v for v in per_exp.values() if math.isfinite(v)]
+        return (max(finite) if finite else 0.0) + CONFIG["penalty_loss"], per_exp
+    total = float(np.mean([per_exp[e.code] for e in exps_here]))
+    return total, per_exp
+
+
+def run_ki_stage_mw(exps, stage1: dict, numMolecules: int, K: int, evallog=None) -> dict:
+    """Determine ki from experimental Mw (CSV `exp_Mw`), between stage 1 and 2.
+    Mirrors the MMD stage but scores simulated Mw (or Đ) against the CSV values."""
+    if not _HAVE_SCIPY:
+        raise RuntimeError("scipy is required for the Mw ki stage")
+    metric = CONFIG["mw_metric"]
+    times = [int(t) for t in CONFIG["mw_ki_times_s"]]
+    avail = [e for e in exps if any(mw_target(e, t, metric) is not None for t in times)]
+    if not avail:
+        LOG.error("[stage-ki-mw] no experimental Mw found in the CSV (need an `exp_Mw` column "
+                  "with values at times %s). Skipping — stage 2 will fit ki from Mn as before.",
+                  times)
+        return {"ki_by_T": {}, "A_ki": None, "Ea_ki": None, "n_used": 0,
+                "codes_used": [], "temps_with_data": []}
+
+    used = sorted(e.code for e in avail)
+    kp_by_T = {float(T): lv["kp"] for T, lv in stage1["levels"].items()} if stage1 else {}
+    temps_with = sorted({e.temperature_C for e in avail})
+    LOG.info("[stage-ki-mw] determining ki from experimental %s (%s) at times %s ; temps: %s C",
+             "Đ=Mw/Mn" if metric == "dispersity" else "Mw", used, times, temps_with)
+    LOG.info("[stage-ki-mw] NOTE: SEC band-broadening inflates measured %s but the raw kMC "
+             "distribution has none, so this can bias ki low; treat as a practical estimate.",
+             "Đ" if metric == "dispersity" else "Mw")
+
+    lo, hi = CONFIG["stage1_k_bounds_log10"]
+    ki_by_T, loss_by_T = {}, {}
+    for T in temps_with:
+        exps_here = [e for e in avail if e.temperature_C == T]
+        kpT = kp_by_T.get(T)
+        if kpT is None:
+            raise RuntimeError(f"[stage-ki-mw] no stage-1 kp for T={T} C (run --stage1 first)")
+
+        def obj(u, exps_here=exps_here, kpT=kpT):
+            ki = 10.0 ** u[0]
+            params = {"A_ki": ki, "Ea_ki": 0.0, "A_kp": kpT, "Ea_kp": 0.0}
+            loss, _ = mw_loss(exps_here, params, numMolecules, K, times, metric)
+            LOG.debug("[stage-ki-mw] T=%.0fC ki=%.4g (kp=%.4g) mw_loss=%.5g", T, ki, kpT, loss)
+            return loss
+
+        res = differential_evolution(
+            obj, bounds=[(lo, hi)],
+            maxiter=CONFIG["mw_ki_maxiter"], popsize=CONFIG["mw_ki_popsize"],
+            tol=CONFIG["mw_ki_tol"], seed=CONFIG["seed"], polish=False, updating="deferred")
+        ki_by_T[T] = 10.0 ** res.x[0]
+        loss_by_T[T] = float(res.fun)
+        LOG.info("[stage-ki-mw] T=%.0f C -> ki(Mw)=%.5g  (loss=%.4g, kp held=%.5g)",
+                 T, ki_by_T[T], loss_by_T[T], kpT)
+
+    A_ki, Ea_ki = _ki_points_to_arrhenius(ki_by_T, temps_with, stage1,
+                                          CONFIG["mw_fixed_Ea_kJ"], tag="stage-ki-mw")
+    return {"method": "Mw" if metric != "dispersity" else "dispersity(Mw/Mn)",
+            "metric": metric, "times_s": times,
+            "ki_by_T": {str(T): ki_by_T[T] for T in temps_with},
             "loss_by_T": {str(T): loss_by_T[T] for T in temps_with},
             "A_ki": A_ki, "Ea_ki": Ea_ki, "n_used": len(used),
             "codes_used": used, "temps_with_data": temps_with}
@@ -1442,13 +1583,14 @@ def write_report(exps, params, stage1, screen, verify, out_dir: Path, run_dir: P
                  "`dispersity_weight>0`, add an `exp_D` column).\n")
 
     if ki_stage is not None and ki_stage.get("n_used", 0) > 0:
-        lines.append("## Stage 1.5 — ki determined from the early-time MMD (before Arrhenius)\n")
-        lines.append(f"**ki is pinned first**, from the experimental 10-min distribution *shape* "
-                     f"(`{CONFIG['mmd_metric']}` distance at t={CONFIG['mmd_fit_times_s']} s), "
-                     f"holding kp(T) at the stage-1 value — *then* the Arrhenius constants are set "
-                     f"(stage 2 fits only kp, with ki held fixed). Experiments used: "
-                     f"{', '.join(ki_stage['codes_used'])}.\n")
-        lines.append("| T (°C) | ki(MMD) | kp(stage-1, held) | shape loss |")
+        method = ki_stage.get("method", "MMD-shape")
+        obs = "MMD" if "MMD" in method else ("Đ=Mw/Mn" if "dispersity" in method else "Mw")
+        lines.append(f"## Stage 1.5 — ki determined from experimental {obs} (before Arrhenius)\n")
+        lines.append(f"**ki is pinned first**, from the experimental {obs} at t={ki_stage['times_s']} s "
+                     f"(method: `{method}`), holding kp(T) at the stage-1 value — *then* the "
+                     f"Arrhenius constants are set (stage 2 fits only kp, with ki held fixed). "
+                     f"Experiments used: {', '.join(ki_stage['codes_used'])}.\n")
+        lines.append(f"| T (°C) | ki({obs}) | kp(stage-1, held) | fit loss |")
         lines.append("|---|---|---|---|")
         for T in ki_stage["temps_with_data"]:
             kiT = ki_stage["ki_by_T"][str(T)]
@@ -1459,12 +1601,17 @@ def write_report(exps, params, stage1, screen, verify, out_dir: Path, run_dir: P
                      f"**Ea_ki = {ki_stage['Ea_ki']/1000:.2f} kJ/mol** (carried into stage 2 as a "
                      f"FIXED ki).")
         if len(ki_stage["temps_with_data"]) < 2:
-            lines.append(f"\n> ⚠️ Only one temperature had MMD data, so **Ea_ki is not identifiable** "
-                         f"from the shape alone — it was held at "
-                         f"{CONFIG['mmd_fixed_Ea_kJ'] if CONFIG['mmd_fixed_Ea_kJ'] is not None else 'the stage-1 seed value'} "
-                         f"and only ki(T) (hence A_ki) was determined. Provide a 10-min MMD at the "
-                         f"other temperature to identify Ea_ki too.")
-        lines.append("\nSee `plots/mmd_overlays.png` for the sim-vs-exp distribution overlays.\n")
+            lines.append(f"\n> ⚠️ Only one temperature had {obs} data, so **Ea_ki is not identifiable** "
+                         f"— it was held (fixed_Ea config, default = the stage-1 seed) and only "
+                         f"ki(T) (hence A_ki) was determined. Provide {obs} at the other temperature "
+                         f"to identify Ea_ki too.")
+        if obs != "MMD":
+            lines.append(f"\n> Note: SEC band-broadening inflates measured {obs} while the raw kMC "
+                         f"distribution has none, so this ki is a **practical estimate** (biased low). "
+                         f"Use `mw_metric=\"dispersity\"` or add temperatures to mitigate.")
+        else:
+            lines.append("\nSee `plots/mmd_overlays.png` for the sim-vs-exp distribution overlays.")
+        lines.append("")
 
     if verify is not None:
         lines.append("## Verification (high-resolution replicates)\n")
@@ -1622,6 +1769,8 @@ def build_argparser():
                     help="coupled global Arrhenius refinement")
     ap.add_argument("--stage-ki", dest="stage_ki", action="store_true",
                     help="determine ki from the 10-min MMD shape (runs between stage1 & stage2)")
+    ap.add_argument("--stage-ki-mw", dest="stage_ki_mw", action="store_true",
+                    help="determine ki from experimental Mw in the CSV (exp_Mw column; between stage1 & stage2)")
     ap.add_argument("--verify", action="store_true",
                     help="re-run best fit K times at verification resolution")
     ap.add_argument("--report", action="store_true",
@@ -1631,6 +1780,8 @@ def build_argparser():
     ap.add_argument("--all-ki", dest="all_ki", action="store_true",
                     help="like --all but WITH the MMD ki stage: setup -> stage1 -> stage-ki "
                          "-> screen -> stage2 -> verify -> report")
+    ap.add_argument("--all-ki-mw", dest="all_ki_mw", action="store_true",
+                    help="like --all but WITH the Mw ki stage (from the CSV exp_Mw column)")
     ap.add_argument("--numMolecules", type=float, default=None,
                     help="override fitting numMolecules for this run")
     ap.add_argument("--reps", type=int, default=None,
@@ -1649,9 +1800,10 @@ def main(argv=None):
     if args.workers is not None:
         CONFIG["max_workers"] = int(args.workers)
 
-    # --all runs the full pipeline WITHOUT the MMD ki stage; --all-ki adds it.
-    run_full = args.all or args.all_ki           # every stage except (maybe) stage-ki
-    run_stage_ki = args.stage_ki or args.all_ki  # stage-ki only when explicitly asked
+    # --all runs the full pipeline WITHOUT any ki stage; --all-ki / --all-ki-mw add one.
+    run_full = args.all or args.all_ki or args.all_ki_mw   # every stage except (maybe) a ki stage
+    run_stage_ki = args.stage_ki or args.all_ki            # MMD-shape ki stage
+    run_stage_ki_mw = args.stage_ki_mw or args.all_ki_mw   # Mw-based ki stage
 
     run_dir = new_run_dir()
     setup_logging(run_dir / "run.log", verbose=True)
@@ -1681,8 +1833,8 @@ def main(argv=None):
 
     # nothing selected -> show help
     if not any([args.setup, args.single, args.eval_once, args.screen,
-                args.stage1, args.stage2, args.stage_ki, args.verify,
-                args.report, args.all, args.all_ki]):
+                args.stage1, args.stage2, args.stage_ki, args.stage_ki_mw, args.verify,
+                args.report, args.all, args.all_ki, args.all_ki_mw]):
         build_argparser().print_help()
         return 0
 
@@ -1719,32 +1871,46 @@ def main(argv=None):
     else:
         stage1 = load_latest_stage1()
 
-    # ---- stage-ki: determine ki FIRST from the MMD (between stage 1 & 2) -----
-    # OPTIONAL — only runs for --stage-ki or --all-ki, NOT for plain --all.
-    # ki is pinned from the early-time distribution shape BEFORE the Arrhenius
-    # constants are fit; stage 2 then holds ki fixed and fits only kp.
+    # ---- stage-ki: determine ki FIRST (between stage 1 & 2) ------------------
+    # OPTIONAL — two alternative methods, each opt-in (NOT run by plain --all):
+    #   --stage-ki    / --all-ki     : from the early-time MMD *shape*
+    #   --stage-ki-mw / --all-ki-mw  : from experimental Mw in the CSV (exp_Mw)
+    # Either pins ki BEFORE the Arrhenius constants are set; stage 2 then holds ki
+    # fixed and fits only kp. If both are requested, the MMD (richer) result wins.
     ki_stage = None
     fixed_ki = None
-    if run_stage_ki:
+
+    def _adopt_ki(ks):
+        nonlocal best, fixed_ki, ki_stage
+        ki_stage = ks
+        if ks.get("A_ki") is not None:
+            fixed_ki = {"A_ki": ks["A_ki"], "Ea_ki": ks["Ea_ki"]}
+            base = dict(best) if best is not None else dict(stage1["arrhenius_seed"])
+            base["A_ki"] = fixed_ki["A_ki"]; base["Ea_ki"] = fixed_ki["Ea_ki"]
+            best = base
+            (run_dir / "stage_ki.json").write_text(json.dumps(ks, indent=2, default=str))
+
+    if run_stage_ki or run_stage_ki_mw:
         if stage1 is None:
-            LOG.error("[stage-ki] needs stage 1 for kp(T). Run --stage1 first (or --all).")
+            LOG.error("[stage-ki] needs stage 1 for kp(T). Run --stage1 first (or --all-ki[/-mw]).")
         else:
-            ki_stage = run_ki_stage(exps, stage1, nMol_fit, K_fit, evallog)
-            if ki_stage.get("A_ki") is not None:
-                fixed_ki = {"A_ki": ki_stage["A_ki"], "Ea_ki": ki_stage["Ea_ki"]}
-                # fold the MMD-determined ki into the running best/seed
-                if best is None:
-                    best = dict(stage1["arrhenius_seed"])
-                best = dict(best); best["A_ki"] = fixed_ki["A_ki"]; best["Ea_ki"] = fixed_ki["Ea_ki"]
-                (run_dir / "stage_ki.json").write_text(json.dumps(ki_stage, indent=2, default=str))
+            if run_stage_ki:
+                _adopt_ki(run_ki_stage(exps, stage1, nMol_fit, K_fit, evallog))
+            if run_stage_ki_mw:
+                if fixed_ki is not None:
+                    LOG.warning("[stage-ki-mw] MMD ki stage already determined ki; skipping the "
+                                "Mw stage (MMD shape is the richer observable). Run only "
+                                "--stage-ki-mw / --all-ki-mw to use Mw instead.")
+                else:
+                    _adopt_ki(run_ki_stage_mw(exps, stage1, nMol_fit, K_fit, evallog))
             did_something = True
-    # Persist the MMD-determined ki across separate invocations (e.g. --stage-ki
+    # Persist the determined ki across separate invocations (e.g. --stage-ki[-mw]
     # then a later --stage2 holds ki fixed).  NEVER for plain --all, which
-    # deliberately excludes the ki stage and must fit all four params from Mn.
+    # deliberately excludes any ki stage and must fit all four params from Mn.
     if fixed_ki is None and not args.all:
         fixed_ki = load_latest_fixed_ki()
         if fixed_ki is not None:
-            LOG.info("[stage2] using ki fixed from a previous --stage-ki "
+            LOG.info("[stage2] using ki fixed from a previous ki stage "
                      "(A_ki=%.4e, Ea_ki=%.1f kJ). Use plain --all to ignore it.",
                      fixed_ki["A_ki"], fixed_ki["Ea_ki"] / 1000)
 
