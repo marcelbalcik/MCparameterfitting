@@ -1,0 +1,6 @@
+monomer: styrene, M=104.15
+ki = 0.25
+kp = 0.20
+sbuli + styrene --ki--> P(1)
+P(n)  + styrene --kp--> P(n+1)
+end

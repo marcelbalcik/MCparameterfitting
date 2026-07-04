@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Fitting harness outputs (generated locally by main.py)
+work/
+results/
+work_test/
+results_test/
+
+# mcPolymer engine scratch that may leak into the repo root during ad-hoc runs
+mcPolymerSimulationresults-ID_*/
+ip_active.mcPolymer
+ip_active.mcPolymer.json
+MMD-S-*.dat
+sim_conversion.csv
+run_meta.json
+log.csv
