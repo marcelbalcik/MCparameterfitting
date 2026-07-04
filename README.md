@@ -45,11 +45,17 @@ python main.py --single TW60      # 2. run ONE folder once → prints Mn(t) (smo
 python main.py --eval-once        # 3. one parallel fan-out for a fixed θ → single global loss
 python main.py --screen           # 4. ki/kp sensitivity + stochastic noise floor
 python main.py --stage1           # 5. per-temperature effective-k warm start + Arrhenius seed
-python main.py --stage-ki         # 6. determine ki from the 10-min MMD shape (BETWEEN stage1 & stage2)
+python main.py --stage-ki         # 6. (optional) determine ki from the 10-min MMD shape (BETWEEN stage1 & stage2)
 python main.py --stage2           # 7. coupled Arrhenius refinement (holds ki fixed if stage-ki ran)
 python main.py --verify           # 8. re-run best fit K× at high numMolecules
-python main.py --all              # setup → stage1 → stage-ki → screen → stage2 → verify → report
+python main.py --all              # setup → stage1 → screen → stage2 → verify → report   (NO ki stage)
+python main.py --all-ki           # same as --all but WITH the MMD ki stage (stage1 → stage-ki → …)
 ```
+
+**The MMD `ki` stage is opt-in.** Plain `--all` does *not* run it (and ignores any
+leftover `stage_ki.json`) — it fits all four parameters from `Mn(t)`. Use
+`--all-ki` to include the ki stage, or run `--stage-ki` explicitly (a later bare
+`--stage2` then continues to hold that `ki` fixed).
 
 ### Stage-ki — determine `ki` FIRST, from the early-time molar-mass distribution
 

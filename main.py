@@ -15,7 +15,8 @@ Run it on the workstation where the mcPolymer engine lives:
     python main.py --stage-ki       # determine ki from the 10-min MMD shape (BETWEEN stage1 & stage2)
     python main.py --stage2         # coupled Arrhenius refinement (holds ki fixed if stage-ki ran)
     python main.py --verify         # re-run best fit K times at verification resolution
-    python main.py --all            # setup -> stage1 -> stage-ki -> screen -> stage2 -> verify -> report
+    python main.py --all            # setup -> stage1 -> screen -> stage2 -> verify -> report  (NO ki stage)
+    python main.py --all-ki         # same as --all but WITH the MMD ki stage (stage1 -> stage-ki -> ...)
     python main.py --report         # (re)write report.md + plots from the latest results
 
 The stages are deliberately independent so each can be validated on its own
@@ -1626,7 +1627,10 @@ def build_argparser():
     ap.add_argument("--report", action="store_true",
                     help="(re)write report.md + plots from the latest results")
     ap.add_argument("--all", action="store_true",
-                    help="setup -> stage1 -> stage-ki -> screen -> stage2 -> verify -> report")
+                    help="setup -> stage1 -> screen -> stage2 -> verify -> report (NO ki/MMD stage)")
+    ap.add_argument("--all-ki", dest="all_ki", action="store_true",
+                    help="like --all but WITH the MMD ki stage: setup -> stage1 -> stage-ki "
+                         "-> screen -> stage2 -> verify -> report")
     ap.add_argument("--numMolecules", type=float, default=None,
                     help="override fitting numMolecules for this run")
     ap.add_argument("--reps", type=int, default=None,
@@ -1644,6 +1648,10 @@ def main(argv=None):
         CONFIG["K_replicates_fit"] = int(args.reps)
     if args.workers is not None:
         CONFIG["max_workers"] = int(args.workers)
+
+    # --all runs the full pipeline WITHOUT the MMD ki stage; --all-ki adds it.
+    run_full = args.all or args.all_ki           # every stage except (maybe) stage-ki
+    run_stage_ki = args.stage_ki or args.all_ki  # stage-ki only when explicitly asked
 
     run_dir = new_run_dir()
     setup_logging(run_dir / "run.log", verbose=True)
@@ -1674,12 +1682,12 @@ def main(argv=None):
     # nothing selected -> show help
     if not any([args.setup, args.single, args.eval_once, args.screen,
                 args.stage1, args.stage2, args.stage_ki, args.verify,
-                args.report, args.all]):
+                args.report, args.all, args.all_ki]):
         build_argparser().print_help()
         return 0
 
     # ---- setup --------------------------------------------------------------
-    if args.setup or args.all:
+    if args.setup or run_full:
         setup_folders(exps, nMol_fit)
         did_something = True
 
@@ -1703,7 +1711,7 @@ def main(argv=None):
         did_something = True
 
     # ---- stage 1 ------------------------------------------------------------
-    if args.stage1 or args.all:
+    if args.stage1 or run_full:
         stage1 = run_stage1(exps, nMol_fit, K_fit)
         (run_dir / "stage1.json").write_text(json.dumps(stage1, indent=2))
         best = dict(stage1["arrhenius_seed"])
@@ -1712,11 +1720,12 @@ def main(argv=None):
         stage1 = load_latest_stage1()
 
     # ---- stage-ki: determine ki FIRST from the MMD (between stage 1 & 2) -----
+    # OPTIONAL — only runs for --stage-ki or --all-ki, NOT for plain --all.
     # ki is pinned from the early-time distribution shape BEFORE the Arrhenius
     # constants are fit; stage 2 then holds ki fixed and fits only kp.
     ki_stage = None
     fixed_ki = None
-    if args.stage_ki or args.all:
+    if run_stage_ki:
         if stage1 is None:
             LOG.error("[stage-ki] needs stage 1 for kp(T). Run --stage1 first (or --all).")
         else:
@@ -1729,9 +1738,15 @@ def main(argv=None):
                 best = dict(best); best["A_ki"] = fixed_ki["A_ki"]; best["Ea_ki"] = fixed_ki["Ea_ki"]
                 (run_dir / "stage_ki.json").write_text(json.dumps(ki_stage, indent=2, default=str))
             did_something = True
-    # persist the fixed-ki across separate invocations (e.g. --stage-ki then --stage2)
-    if fixed_ki is None:
+    # Persist the MMD-determined ki across separate invocations (e.g. --stage-ki
+    # then a later --stage2 holds ki fixed).  NEVER for plain --all, which
+    # deliberately excludes the ki stage and must fit all four params from Mn.
+    if fixed_ki is None and not args.all:
         fixed_ki = load_latest_fixed_ki()
+        if fixed_ki is not None:
+            LOG.info("[stage2] using ki fixed from a previous --stage-ki "
+                     "(A_ki=%.4e, Ea_ki=%.1f kJ). Use plain --all to ignore it.",
+                     fixed_ki["A_ki"], fixed_ki["Ea_ki"] / 1000)
 
     # ---- one fixed-theta fan-out -------------------------------------------
     if args.eval_once:
@@ -1744,7 +1759,7 @@ def main(argv=None):
         did_something = True
 
     # ---- screen -------------------------------------------------------------
-    if args.screen or args.all:
+    if args.screen or run_full:
         params = best or (stage1["arrhenius_seed"] if stage1 else
                           load_latest_best_params() or default_params_from_model())
         screen = run_screen(exps, params, nMol_fit)
@@ -1752,7 +1767,7 @@ def main(argv=None):
         did_something = True
 
     # ---- stage 2 ------------------------------------------------------------
-    if args.stage2 or args.all:
+    if args.stage2 or run_full:
         seed_params = best or (stage1["arrhenius_seed"] if stage1 else None) \
             or load_latest_best_params()
         x0 = params_to_x(seed_params) if seed_params else None
@@ -1767,7 +1782,7 @@ def main(argv=None):
         best = load_latest_best_params()
 
     # ---- verify -------------------------------------------------------------
-    if args.verify or args.all:
+    if args.verify or run_full:
         params = best or load_latest_best_params()
         if params is None:
             LOG.error("[verify] no best params available (run --stage2 first)")
@@ -1780,7 +1795,7 @@ def main(argv=None):
             did_something = True
 
     # ---- report + plots -----------------------------------------------------
-    if args.report or args.all or args.stage2 or args.stage_ki or args.verify or args.eval_once:
+    if args.report or run_full or args.stage2 or args.stage_ki or args.verify or args.eval_once:
         if best is None:
             best = load_latest_best_params()
         if last_results is None and best is not None:
