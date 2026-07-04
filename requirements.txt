@@ -1,0 +1,11 @@
+# main.py (the fitting harness) needs only the standard scientific stack.
+# The mcPolymer engine + kineticModel.py / modelInterpreter.py must already be
+# importable in the same environment (they are exercised only by TWXX.py).
+numpy
+pandas
+scipy
+matplotlib
+
+# Optional: enable the CMA-ES optimizer (set CONFIG["stage2_optimizer"]="cma").
+# Differential evolution (scipy, above) is the default and needs nothing extra.
+# cma
