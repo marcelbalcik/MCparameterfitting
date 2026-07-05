@@ -54,16 +54,46 @@ python main.py --all-ki           # same as --all but WITH the MMD ki stage
 python main.py --all-ki-mw        # same as --all but WITH the Mw ki stage (CSV exp_Mw)
 ```
 
-**Both `ki` stages are opt-in and mutually alternative.** Plain `--all` runs
-*neither* (and ignores any leftover `stage_ki.json`) — it fits all four parameters
-from `Mn(t)`. Pick one:
-- `--all-ki` / `--stage-ki` → determine `ki` from the 10-min **MMD shape** (needs `exp_mmd/` curve files).
-- `--all-ki-mw` / `--stage-ki-mw` → determine `ki` from experimental **Mw** in the CSV (needs an `exp_Mw` column).
+### Two ways to determine `ki` (both need early-time breadth data)
 
-Either runs between stage 1 and stage 2 and pins `ki` (per temperature, holding
-stage-1's `kp`) *before* stage 2 sets the Arrhenius constants with `ki` held
-fixed. A later bare `--stage2` continues to hold whichever `ki` the stage found.
-If you request both in one run, the MMD (richer) result wins.
+`ki` is not identifiable from `Mn(t)` alone. There are two designs — pick one:
+
+**(A) Joint objective — *recommended*, symmetric.** One coupled stage-2 regression
+fits **all four** Arrhenius params against `Mn(t)` **plus a breadth term** (`Đ = Mw/Mn`
+or `Mw`). `ki` is treated exactly like `kp` — same optimizer, same method — with the
+breadth term supplying the `ki` constraint `Mn` lacks. Turn it on in CONFIG:
+
+```python
+"joint_breadth_enable":     True,
+"joint_breadth_observable": "dispersity",   # "dispersity" (Đ=Mw/Mn) | "mw"
+"joint_breadth_weight":     2.0,            # weight of each breadth residual vs one Mn residual
+"joint_breadth_times_s":    [600],          # 10 min carries the ki signal
+```
+
+Then just run `python main.py --all` (or `--stage2`) — no ki stage, `ki` and `kp`
+come out of the same fit. Needs `exp_Mw` (or `exp_D`) in the CSV, at **both**
+temperatures for `Ea_ki` to be identifiable.
+
+**(B) Separate ki stage — pins `ki` first, then holds it.** Plain `--all` runs
+*neither* ki stage (and ignores any leftover `stage_ki.json`) — it fits all four
+from `Mn(t)`. Opt in with:
+- `--all-ki` / `--stage-ki` → `ki` from the 10-min **MMD shape** (needs `exp_mmd/` curve files).
+- `--all-ki-mw` / `--stage-ki-mw` → `ki` from experimental **Mw** in the CSV (`exp_Mw`).
+
+These run between stage 1 and stage 2, pin `ki` per temperature (holding stage-1's
+`kp`), then stage 2 sets the Arrhenius constants with `ki` **held fixed**. A later
+bare `--stage2` keeps holding that `ki`. If both MMD and Mw are requested, MMD wins.
+
+> Use **A or B, not both** — B hard-fixes `ki` so B's breadth term can't move it.
+> The code warns if you enable both.
+
+### SEC band-broadening correction (for either breadth method)
+
+Measured `Mw`/`Đ` are inflated by SEC axial dispersion, but the raw kMC distribution
+has none — so a raw comparison biases `ki` low. Set `sec_broadening_sigma_log10M`
+(CONFIG, default `0` = off) to Gaussian-broaden the *simulated* MMD before computing
+`Mn/Mw/Đ`, making sim and exp comparable. We estimated **≈ 0.063** for the TW067
+column set from its internal-standard peak; use your own if you have narrow standards.
 
 ### `--stage-ki-mw` — determine `ki` from Mw in the CSV
 
