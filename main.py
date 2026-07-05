@@ -153,6 +153,11 @@ CONFIG = {
     # ---- Mn extraction -------------------------------------------------------
     "force_x_col":          "auto",           # "auto"|"c0"|"c1"|"swap" (assumption A2)
     "mmd_glob":             "MMD-S-{t}.dat",
+    # SEC band-broadening applied to the SIMULATED MMD (Gaussian in log10 M) before
+    # computing Mn/Mw/Đ, so the sim is comparable to the broadened SEC data and the
+    # breadth-based ki is unbiased. 0 = off. For the TW067 column set we estimated
+    # ~0.063 from the internal-standard peak. Affects every Mn/Mw/Đ the code reads.
+    "sec_broadening_sigma_log10M": 0.0,
 
     # ---- objective -----------------------------------------------------------
     # residual on Mn: "log"  -> ln(Mn_sim) - ln(Mn_exp)   (default; scale-free)
@@ -162,10 +167,17 @@ CONFIG = {
     #   "per_experiment"  -> every experiment weighted equally (default)
     #   "per_temperature" -> average within a T level, then average the two levels
     "loss_normalization":   "per_experiment",
-    # DISABLED hook for a second observable (dispersity / Mw). Set weight > 0 and
-    # populate exp_D in the CSV to switch it on; strongly constrains ki.
-    "use_dispersity_term":  False,
-    "dispersity_weight":    0.0,
+    # ---- JOINT objective: fit ki AND kp together (one method, symmetric) ------
+    # When enabled, the SAME optimizer fits all four Arrhenius params against a
+    # combined loss = Mn(t) residual + a breadth residual (Đ or Mw). ki is then
+    # determined exactly like kp (one coupled regression), with the breadth term
+    # supplying the ki constraint that Mn alone lacks. Needs exp_Mw (or exp_D) in
+    # the CSV. Recommended path instead of the separate hard-fix ki stage:
+    #   set joint_breadth_enable=True, run plain --stage2 / --all (fits all four).
+    "joint_breadth_enable":     False,
+    "joint_breadth_observable": "dispersity",  # "dispersity" (Đ=Mw/Mn) | "mw"
+    "joint_breadth_weight":     2.0,     # weight of EACH breadth residual vs a single Mn residual
+    "joint_breadth_times_s":    [600],   # times whose breadth to score (10 min carries the ki signal)
     "penalty_loss":         1.0e3,            # returned when a sim eval fails (keeps DE alive)
 
     # ---- parallelism ---------------------------------------------------------
@@ -499,9 +511,35 @@ def find_mmd_file(run_dir: Path, t_s: int) -> Path | None:
     return max(cands, key=lambda p: p.stat().st_mtime)
 
 
+def apply_sec_broadening(df_xy):
+    """Convolve a distribution w(log10 M) with a Gaussian of width
+    sec_broadening_sigma_log10M (in log10 M), emulating SEC axial dispersion so the
+    simulated Mn/Mw/Đ become comparable to broadened SEC data. No-op when sigma=0."""
+    sigma = float(CONFIG.get("sec_broadening_sigma_log10M", 0.0) or 0.0)
+    if sigma <= 0:
+        return df_xy
+    x = df_xy["x"].to_numpy(dtype=float)
+    y = df_xy["y"].to_numpy(dtype=float)
+    if x.size < 3:
+        return df_xy
+    dx = float(np.median(np.diff(x)))
+    if not np.isfinite(dx) or dx <= 0:
+        return df_xy
+    half = max(1, int(math.ceil(4.0 * sigma / dx)))
+    half = min(half, (x.size - 1) // 2)   # keep kernel <= curve length so mode="same" preserves length
+    if half < 1:
+        return df_xy
+    k = np.arange(-half, half + 1) * dx
+    kern = np.exp(-0.5 * (k / sigma) ** 2)
+    kern /= kern.sum()
+    yb = np.convolve(y, kern, mode="same")
+    return pd.DataFrame({"x": x, "y": yb})
+
+
 def mn_from_mmd(path: Path) -> dict:
     df2 = mwd.load_first_two_numeric_cols(path)
     df_xy, swapped = mwd.choose_xy_as_logm(df2, force=CONFIG["force_x_col"])
+    df_xy = apply_sec_broadening(df_xy)     # no-op unless sec_broadening_sigma_log10M > 0
     m = mwd.compute_mwd_metrics(df_xy)
     return {"Mn": m["Mn_gmol"], "Mw": m["Mw_gmol"], "D": m["D"],
             "peak_M": m["peak_M_gmol"], "swapped": swapped}
@@ -728,17 +766,38 @@ def residual(mn_sim: float, mn_exp: float) -> float:
     return (mn_sim - mn_exp) / mn_exp
 
 
+def exp_breadth_target(exp: Experiment, t: int):
+    """Experimental breadth observable at time t for the joint objective:
+    Đ = exp_Mw/exp_Mn (preferred), or exp_D if that's what the CSV carries, or Mw."""
+    obs = CONFIG["joint_breadth_observable"]
+    if obs == "mw":
+        return exp.Mw_by_time.get(int(t))
+    # dispersity
+    Mw = exp.Mw_by_time.get(int(t)); Mn = exp.Mn_by_time.get(int(t))
+    if Mw is not None and Mn:
+        return Mw / Mn
+    return exp.D_by_time.get(int(t))    # fall back to an exp_D column if provided
+
+
 def per_experiment_sse(exp: Experiment, per_time: dict) -> float:
-    """Mean squared residual over this experiment's fit times."""
+    """Mean squared residual over this experiment's fit times.
+    With joint_breadth_enable, also adds a breadth (Đ or Mw) residual at the
+    configured times — this is what lets one coupled fit determine ki AND kp."""
     rs = []
     for t in exp.fit_times_s:
         if t not in per_time:
             return float("nan")
         rs.append(residual(per_time[t]["Mn"], exp.Mn_by_time[t]))
-        if CONFIG["use_dispersity_term"] and t in exp.D_by_time and CONFIG["dispersity_weight"] > 0:
-            d_sim = per_time[t]["D"]
-            d_exp = exp.D_by_time[t]
-            rs.append(CONFIG["dispersity_weight"] * (math.log(d_sim) - math.log(d_exp)))
+    if CONFIG["joint_breadth_enable"] and CONFIG["joint_breadth_weight"] > 0:
+        w = CONFIG["joint_breadth_weight"]
+        obs = CONFIG["joint_breadth_observable"]
+        for t in CONFIG["joint_breadth_times_s"]:
+            tgt = exp_breadth_target(exp, int(t))
+            if tgt is None or int(t) not in per_time:
+                continue
+            sim = per_time[int(t)]["D"] if obs != "mw" else per_time[int(t)]["Mw"]
+            if sim > 0 and tgt > 0:
+                rs.append(w * (math.log(sim) - math.log(tgt)))
     return float(np.mean(np.square(rs)))
 
 
@@ -1577,10 +1636,11 @@ def write_report(exps, params, stage1, screen, verify, out_dir: Path, run_dir: P
     else:
         lines.append("_Run --screen to quantify ki/kp sensitivity and the noise floor._\n")
     lines.append("**Recommendation:** with Mn-only data ki is weakly identified (early-time "
-                 "transient only). The MMD stage below (`--stage-ki`) resolves this directly from "
-                 "the early-time distribution *shape*; a dispersity (Đ = Mw/Mn) or Mw time series "
-                 "is an alternative second observable (hook: `use_dispersity_term=True`, "
-                 "`dispersity_weight>0`, add an `exp_D` column).\n")
+                 "transient only). Two ways to resolve it: (a) the **joint objective** "
+                 "(`joint_breadth_enable=True`) fits ki AND kp in one coupled stage-2 regression "
+                 "against Mn + a breadth term (Đ or Mw from the CSV) — ki treated exactly like kp; "
+                 "or (b) the separate **ki stage** (`--stage-ki[-mw]`) that pins ki first and holds "
+                 "it. Both need early-time breadth data (exp_Mw / MMD).\n")
 
     if ki_stage is not None and ki_stage.get("n_used", 0) > 0:
         method = ki_stage.get("method", "MMD-shape")
@@ -1633,6 +1693,16 @@ def write_report(exps, params, stage1, screen, verify, out_dir: Path, run_dir: P
                  f"`{CONFIG['residual_kind']}` scale, normalized `{CONFIG['loss_normalization']}` "
                  "so the four 30 °C experiments do not swamp the two 20 °C experiments. The "
                  "720-min point is excluded from the residuals (used only to set n_I,eff).")
+    if CONFIG["joint_breadth_enable"]:
+        obs = "Đ = Mw/Mn" if CONFIG["joint_breadth_observable"] != "mw" else "Mw"
+        lines.append(f"- **Joint objective (ON):** ki and kp were fit **together** in one coupled "
+                     f"stage-2 regression against Mn **plus** a breadth term ({obs}, weight "
+                     f"{CONFIG['joint_breadth_weight']}, at t={CONFIG['joint_breadth_times_s']} s). "
+                     f"ki is treated exactly like kp — the breadth term supplies the ki constraint "
+                     f"that Mn alone lacks." +
+                     (f" Simulated Mn/Mw/Đ were SEC-broadened by σ="
+                      f"{CONFIG['sec_broadening_sigma_log10M']:.3f} log10M to match the SEC data."
+                      if CONFIG.get('sec_broadening_sigma_log10M', 0.0) else ""))
     lines.append("- **Conversion is a diagnostic only** (X(t)=Mn(t)/Mn₇₂₀ in the data carries no "
                  "information independent of Mn); the simulated monomer-balance conversion in "
                  "`sim_conversion.csv` is never scored.")
@@ -1823,6 +1893,18 @@ def main(argv=None):
     nMol_fit = CONFIG["numMolecules_fit"]
     K_fit = CONFIG["K_replicates_fit"]
 
+    if CONFIG["joint_breadth_enable"]:
+        obs = "Đ=Mw/Mn" if CONFIG["joint_breadth_observable"] != "mw" else "Mw"
+        nbt = [e.code for e in exps if any(exp_breadth_target(e, t) is not None
+                                           for t in CONFIG["joint_breadth_times_s"])]
+        LOG.info("[joint] JOINT objective ON: fitting ki AND kp together against Mn + %s "
+                 "(weight %.2f) at t=%s. Breadth data present for: %s",
+                 obs, CONFIG["joint_breadth_weight"], CONFIG["joint_breadth_times_s"],
+                 nbt or "NONE (add exp_Mw to the CSV!)")
+        if CONFIG.get("sec_broadening_sigma_log10M", 0.0):
+            LOG.info("[joint] SEC broadening σ=%.3f log10M applied to simulated Mn/Mw/Đ.",
+                     CONFIG["sec_broadening_sigma_log10M"])
+
     did_something = False
     stage1 = None
     best = None
@@ -1890,6 +1972,11 @@ def main(argv=None):
             best = base
             (run_dir / "stage_ki.json").write_text(json.dumps(ks, indent=2, default=str))
 
+    if (run_stage_ki or run_stage_ki_mw) and CONFIG["joint_breadth_enable"]:
+        LOG.warning("[config] joint_breadth_enable=True AND a hard-fix ki stage were both "
+                    "requested. These are two different designs — the ki stage will PIN ki "
+                    "(stage 2 can't move it), making the joint breadth term redundant. Pick one: "
+                    "joint objective (drop --stage-ki*) OR the ki stage (set joint_breadth_enable=False).")
     if run_stage_ki or run_stage_ki_mw:
         if stage1 is None:
             LOG.error("[stage-ki] needs stage 1 for kp(T). Run --stage1 first (or --all-ki[/-mw]).")
