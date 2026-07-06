@@ -337,7 +337,7 @@ def load_experiments(csv_path: Path):
     if sep != ",":
         LOG.info("[data] detected '%s'-separated CSV", sep)
     required = {"code", "temperature_C", "n_styrene_mol", "n_sbuli_charged_mol",
-                "n_cyclohexane_mol", "n_sbuli_eff_mol", "time_s", "Mn", "is_full_conversion"}
+                "n_cyclohexane_mol", "time_s", "Mn", "is_full_conversion"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"{csv_path} is missing columns: {sorted(missing)}  "
@@ -364,13 +364,17 @@ def load_experiments(csv_path: Path):
             Mw_by_time = {int(t): float(w) for t, w in zip(fit_rows["time_s"], fit_rows["exp_Mw"])
                           if pd.notna(w)}
         r0 = g.iloc[0]
+        # n_sbuli_eff_mol is now optional (the sim uses the charged initiator);
+        # keep it only if present, for the report's titer diagnostic.
+        n_eff = float(r0["n_sbuli_eff_mol"]) if "n_sbuli_eff_mol" in df.columns \
+            else float(r0["n_sbuli_charged_mol"])
         exp = Experiment(
             code=str(code),
             temperature_C=r0["temperature_C"],
             n_styrene_mol=r0["n_styrene_mol"],
             n_sbuli_charged_mol=r0["n_sbuli_charged_mol"],
             n_cyclohexane_mol=r0["n_cyclohexane_mol"],
-            n_sbuli_eff_mol=r0["n_sbuli_eff_mol"],
+            n_sbuli_eff_mol=n_eff,
             fit_times_s=fit_times,
             Mn_by_time=Mn_by_time,
             Mn720=Mn720,
@@ -405,8 +409,9 @@ def make_experiment_json(exp: Experiment, numMolecules: int) -> dict:
         "code": exp.code,
         "temperature_C": exp.temperature_C,
         "n_styrene_mol": exp.n_styrene_mol,
-        # EFFECTIVE initiator (n_I,eff = charge/Mn720) — NOT the charged titer:
-        "n_sbuli_mol": exp.n_sbuli_eff_mol,
+        # Simulation uses the CHARGED s-BuLi exactly as entered — no effective-
+        # initiator substitution, no calculation.
+        "n_sbuli_mol": exp.n_sbuli_charged_mol,
         "n_cyclohexane_mol": exp.n_cyclohexane_mol,
         "export_times_s": list(exp.fit_times_s),
         "dt_s": CONFIG["dt_s"],
@@ -1586,19 +1591,17 @@ def write_report(exps, params, stage1, screen, verify, out_dir: Path, run_dir: P
     else:
         lines.append("_No fitted parameters yet (run --stage1/--stage2)._\n")
 
-    lines.append("## Effective-initiator / titer diagnostic\n")
-    lines.append("n_I,eff is set from the 720-min Mn (n_I,eff = 4.0000 g / Mn₇₂₀), so each "
-                 "simulation reproduces its final Mn by construction; the 10–60 min Mn shape "
-                 "is the kinetic signal.\n")
-    lines.append("| code | T (°C) | Mn₇₂₀ | n_I,eff (mol) | n_charged (mol) | eff/charged |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("## Initiator\n")
+    lines.append("The simulation uses the **charged s-BuLi** (`n_sbuli_charged_mol`) exactly as "
+                 "entered — no effective-initiator substitution. Because the chain count is the "
+                 "charged titer (not back-solved from Mn₇₂₀), absolute Mn is a genuine prediction, "
+                 "not matched by construction.\n")
+    lines.append("| code | T (°C) | Mn₇₂₀ | n_sbuli_charged (mol) |")
+    lines.append("|---|---|---|---|")
     for e in exps:
         lines.append(f"| {e.code} | {e.temperature_C:.0f} | {e.Mn720:.0f} | "
-                     f"{e.n_sbuli_eff_mol:.4e} | {e.n_sbuli_charged_mol:.4e} | "
-                     f"{100*e.titer_ratio:.1f}% |")
-    lines.append("\nEfficiencies straddling 100% (some >100%, impossible for a living ki/kp "
-                 "model) confirm charged-titer / SEC-calibration scatter, not kinetics — which "
-                 "is exactly why the charged titer is discarded and n_I,eff is used instead.\n")
+                     f"{e.n_sbuli_charged_mol:.4e} |")
+    lines.append("")
 
     if stage1 is not None:
         lines.append("## Stage 1 — decoupled per-temperature effective k (warm start)\n")
