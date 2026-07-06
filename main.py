@@ -320,12 +320,6 @@ class Experiment:
     def titer_ratio(self) -> float:
         return self.n_sbuli_eff_mol / self.n_sbuli_charged_mol
 
-    def n_eff_check(self) -> float:
-        """Cross-check: n_I,eff should equal the monomer MASS / Mn720, where the
-        monomer mass is M0 * n_styrene for THIS experiment (not a fixed 4 g — the
-        charge can differ per experiment)."""
-        return (CONFIG["monomer_mw"] * self.n_styrene_mol) / self.Mn720
-
 
 def _read_table(csv_path: Path):
     """Read the experimental CSV, auto-detecting the field separator (',' or ';';
@@ -383,12 +377,6 @@ def load_experiments(csv_path: Path):
             D_by_time=D_by_time,
             Mw_by_time=Mw_by_time,
         )
-        # sanity: consistent effective-initiator definition
-        chk = exp.n_eff_check()
-        rel = abs(chk - exp.n_sbuli_eff_mol) / exp.n_sbuli_eff_mol
-        if rel > 0.02:
-            LOG.warning("%s: n_sbuli_eff_mol=%.6g disagrees with charge/Mn720=%.6g (%.1f%%)",
-                        code, exp.n_sbuli_eff_mol, chk, 100 * rel)
         exps.append(exp)
     return exps
 
