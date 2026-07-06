@@ -137,7 +137,8 @@ CONFIG = {
     "T_ref_C":             0.0,               # T[K] = T[C] + 273.15
     "T_offset_K":          273.15,
     "monomer_mw":          104.15,            # styrene, g/mol (for Mn/DP diagnostics)
-    "charge_mass_g":       4.0000,            # constant styrene charge; n_I,eff = charge/Mn720
+    "charge_mass_g":       4.0000,            # (informational) nominal styrene charge; the n_I,eff
+                                              # cross-check uses M0*n_styrene per experiment, not this
 
     # ---- simulation settings written into experiment.json --------------------
     "dt_s":                1,                 # volume-balance update step (integer seconds)
@@ -319,18 +320,28 @@ class Experiment:
     def titer_ratio(self) -> float:
         return self.n_sbuli_eff_mol / self.n_sbuli_charged_mol
 
-    def n_eff_check(self) -> float:
-        """Cross-check: n_I,eff should equal charge_mass / Mn720."""
-        return CONFIG["charge_mass_g"] / self.Mn720
+
+def _read_table(csv_path: Path):
+    """Read the experimental CSV, auto-detecting the field separator (',' or ';';
+    many European/GPC exports use ';'). Column names are stripped of whitespace."""
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        head = f.readline()
+    sep = ";" if head.count(";") > head.count(",") else ","
+    df = pd.read_csv(csv_path, sep=sep)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df, sep
 
 
 def load_experiments(csv_path: Path):
-    df = pd.read_csv(csv_path)
+    df, sep = _read_table(csv_path)
+    if sep != ",":
+        LOG.info("[data] detected '%s'-separated CSV", sep)
     required = {"code", "temperature_C", "n_styrene_mol", "n_sbuli_charged_mol",
                 "n_cyclohexane_mol", "n_sbuli_eff_mol", "time_s", "Mn", "is_full_conversion"}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"{csv_path} is missing columns: {sorted(missing)}")
+        raise ValueError(f"{csv_path} is missing columns: {sorted(missing)}  "
+                         f"(found: {sorted(df.columns)}; separator detected: '{sep}')")
 
     exps = []
     for code, g in df.groupby("code", sort=False):
@@ -366,12 +377,6 @@ def load_experiments(csv_path: Path):
             D_by_time=D_by_time,
             Mw_by_time=Mw_by_time,
         )
-        # sanity: consistent effective-initiator definition
-        chk = exp.n_eff_check()
-        rel = abs(chk - exp.n_sbuli_eff_mol) / exp.n_sbuli_eff_mol
-        if rel > 0.02:
-            LOG.warning("%s: n_sbuli_eff_mol=%.6g disagrees with charge/Mn720=%.6g (%.1f%%)",
-                        code, exp.n_sbuli_eff_mol, chk, 100 * rel)
         exps.append(exp)
     return exps
 
