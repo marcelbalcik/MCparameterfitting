@@ -1,4 +1,3 @@
 code,temperature_C,n_styrene_mol,n_sbuli_mol,n_cyclohexane_mol
-NEW_20C,20,0.0384,7.5e-5,0.60
 NEW_30C,30,0.0384,7.5e-5,0.60
 NEW_dilute,30,0.0384,4.0e-5,1.0

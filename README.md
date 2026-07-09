@@ -79,7 +79,9 @@ python main.py --predict --predict-csv other.csv
 
 For each recipe it computes `ki(T), kp(T)` from the fitted Arrhenius params, runs
 the kMC forward, and writes **`predictions.csv`** (`code, T, ki, kp, time_s,
-Mn_pred, Mn_std, Mw_pred, D_pred`) plus `plots/predictions.png`. Export times are
+conversion_avg, Mn_pred, Mn_std, Mw_pred, D_pred`) plus `plots/predictions.png`.
+`conversion_avg` is the replicate-averaged true monomer-balance conversion
+(`1 − mol_styrene(t)/mol_styrene(0)`). Export times are
 `predict_times_s` in CONFIG (default 10/20/40/60 min — set any list, including
 beyond 60 min). Resolution/replicates: `predict_numMolecules`, `predict_reps`.
 This mode needs no `experimental_data.csv`.
