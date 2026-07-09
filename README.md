@@ -49,10 +49,42 @@ python main.py --stage-ki         # 6a. (optional) determine ki from the 10-min 
 python main.py --stage-ki-mw      # 6b. (optional) determine ki from experimental Mw in the CSV
 python main.py --stage2           # 7. coupled Arrhenius refinement (holds ki fixed if a ki stage ran)
 python main.py --verify           # 8. re-run best fit K× at high numMolecules
+python main.py --predict          # predict Mn(t) for NEW recipes (T + moles only) — see below
 python main.py --all              # setup → stage1 → screen → stage2 → verify → report   (NO ki stage)
 python main.py --all-ki           # same as --all but WITH the MMD ki stage
 python main.py --all-ki-mw        # same as --all but WITH the Mw ki stage (CSV exp_Mw)
 ```
+
+### Predicting new experiments (`--predict`)
+
+Once you have a fit (`best_params.json` under `results/`), predict `Mn(t)` for
+**new recipes you have not run** — you supply only temperature and initial moles,
+no Mn data. Put the recipes in **`predict.csv`**:
+
+```
+code,temperature_C,n_styrene_mol,n_sbuli_mol,n_cyclohexane_mol
+NEW_20C,20,0.0384,7.5e-5,0.60
+NEW_30C,30,0.0384,7.5e-5,0.60
+NEW_dilute,30,0.0384,4.0e-5,1.0
+```
+
+`n_sbuli_mol` is the initiator used as-is (charged). Then:
+
+```bash
+python main.py --predict                    # uses predict.csv + the latest best_params.json
+python main.py --predict --predict-csv other.csv
+```
+
+For each recipe it computes `ki(T), kp(T)` from the fitted Arrhenius params, runs
+the kMC forward, and writes **`predictions.csv`** (`code, T, ki, kp, time_s,
+Mn_pred, Mn_std, Mw_pred, D_pred`) plus `plots/predictions.png`. Export times are
+`predict_times_s` in CONFIG (default 10/20/40/60 min — set any list, including
+beyond 60 min). Resolution/replicates: `predict_numMolecules`, `predict_reps`.
+This mode needs no `experimental_data.csv`.
+
+> Predictions are only as good as the fit: at a `[P*]`/dilution far from the
+> calibration set the single-`kp` (no-aggregation) bias applies, and extrapolating
+> outside the fitted temperatures assumes Arrhenius holds.
 
 ### Two ways to determine `ki` (both need early-time breadth data)
 
