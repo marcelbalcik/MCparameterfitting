@@ -623,6 +623,7 @@ def run_all(exps, coeffs_by_code: dict, numMolecules: int, K: int) -> dict:
     results = {exp.code: {"per_time_reps": [], "errors": []} for exp in exps}
 
     for exp in exps:
+        results[exp.code]["conv_reps"] = []
         for (r, rd, ok, msg) in fanout[exp.code]:
             if not ok:
                 results[exp.code]["errors"].append(f"rep{r}: {msg}")
@@ -633,24 +634,42 @@ def run_all(exps, coeffs_by_code: dict, numMolecules: int, K: int) -> dict:
             except Exception as e:
                 results[exp.code]["errors"].append(f"rep{r}: extract: {e}")
                 LOG.warning("[run] %s rep%d extract FAILED: %s", exp.code, r, e)
+            # true monomer-balance conversion from the driver's sim_conversion.csv (diagnostic)
+            results[exp.code]["conv_reps"].append(read_conversion(rd))
 
     # average replicates
     for exp in exps:
         reps = results[exp.code]["per_time_reps"]
+        conv_reps = [c for c in results[exp.code].get("conv_reps", []) if c]
         per_time = {}
         if reps:
             for t in exp.fit_times_s:
                 Mns = [rep[t]["Mn"] for rep in reps if t in rep]
                 Mws = [rep[t]["Mw"] for rep in reps if t in rep]
                 Ds = [rep[t]["D"] for rep in reps if t in rep]
+                convs = [c[t] for c in conv_reps if t in c]
                 per_time[t] = {
                     "Mn": float(np.mean(Mns)), "Mn_std": float(np.std(Mns, ddof=0)),
                     "Mw": float(np.mean(Mws)),
                     "D": float(np.mean(Ds)),
+                    "conversion": float(np.mean(convs)) if convs else float("nan"),
                     "n_rep": len(Mns),
                 }
         results[exp.code]["per_time"] = per_time
     return results
+
+
+def read_conversion(run_dir: Path) -> dict:
+    """Read the driver's sim_conversion.csv -> {time_s: conversion_true}.
+    Empty dict if the file is missing/unreadable."""
+    p = Path(run_dir) / "sim_conversion.csv"
+    if not p.exists():
+        return {}
+    try:
+        df = pd.read_csv(p)
+        return {int(t): float(c) for t, c in zip(df["time_s"], df["conversion_true"])}
+    except Exception:
+        return {}
 
 
 # =============================================================================
@@ -1504,6 +1523,7 @@ def run_predict(params: dict, run_dir: Path, predict_csv=None):
                 "n_styrene_mol": e.n_styrene_mol, "n_sbuli_mol": e.n_sbuli_charged_mol,
                 "n_cyclohexane_mol": e.n_cyclohexane_mol,
                 "time_s": t, "time_min": t / 60.0,
+                "conversion_avg": s.get("conversion", float("nan")),
                 "Mn_pred": s.get("Mn", float("nan")), "Mn_std": s.get("Mn_std", float("nan")),
                 "Mw_pred": s.get("Mw", float("nan")), "D_pred": s.get("D", float("nan")),
                 "n_rep": s.get("n_rep", 0),
