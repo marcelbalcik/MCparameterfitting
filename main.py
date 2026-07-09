@@ -1553,11 +1553,17 @@ def _mn_table(exps, results):
         pt = results[e.code]["per_time"]
         for t in e.fit_times_s:
             sim = pt.get(t, {})
+            mn_exp = e.Mn_by_time.get(t, float("nan"))
+            mn_sim = sim.get("Mn", float("nan"))
+            rel = (mn_sim / mn_exp - 1.0) * 100.0 if (mn_exp and mn_exp == mn_exp) else float("nan")
             rows.append({
-                "code": e.code, "temperature_C": e.temperature_C, "time_s": t,
-                "Mn_exp": e.Mn_by_time[t],
-                "Mn_sim": sim.get("Mn", float("nan")),
+                "code": e.code, "temperature_C": e.temperature_C,
+                "time_s": t, "time_min": t / 60.0,
+                "Mn_exp": mn_exp,
+                "Mn_sim": mn_sim,
                 "Mn_sim_std": sim.get("Mn_std", float("nan")),
+                "Mn_pct_error": rel,
+                "Mw_sim": sim.get("Mw", float("nan")),
                 "D_sim": sim.get("D", float("nan")),
                 "n_rep": sim.get("n_rep", 0),
             })
@@ -2215,6 +2221,10 @@ def main(argv=None):
             make_mmd_plot(exps, best, run_dir / "plots")
             write_report(exps, best, stage1, screen, verify, run_dir, run_dir, ki_stage=ki_stage)
             save_best_params(best, last_breakdown, run_dir)
+            # tabular Mn(t): exp vs sim (+Mw, Đ, % error) — the data behind the overlays
+            mn_csv = run_dir / "mn_results.csv"
+            _mn_table(exps, last_results).to_csv(mn_csv, index=False)
+            LOG.info("[report] wrote %s", mn_csv)
         else:
             LOG.warning("[report] no simulation results available to plot/report")
         did_something = True
