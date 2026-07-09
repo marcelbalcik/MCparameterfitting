@@ -186,11 +186,10 @@ parameters from `Mn(t)` as before (fully backward compatible). Output:
 `ki` pinned in `best_params.*`, `stage_ki.json` (with the per-temperature
 `ki(T)`), and `plots/mmd_overlays.png` (sim vs exp curves).
 
-> M-axis consistency: because `n_I,eff` is derived from the SEC `Mn(720)`, the
-> simulation's absolute molar-mass axis is tied to the **same SEC calibration** as
-> your experimental curve, so comparing them on `log10(M)` is meaningful. If your
-> SEC axis is only relative / PS-equivalent, prefer `mmd_metric="dispersity"` or
-> `"wasserstein"` (less sensitive to an absolute peak-position offset).
+> M-axis note: the simulated distribution is on an absolute molar-mass axis while
+> your experimental curve is SEC-calibrated. If they don't share an absolute
+> scale, prefer `mmd_metric="dispersity"` or `"wasserstein"` (less sensitive to an
+> absolute peak-position offset) over the position-sensitive L2.
 
 Before wiring the optimizer, validate the driver alone:
 `cd work/TW60 && python TWXX.py` (uses the folder's JSONs) should produce
@@ -210,10 +209,9 @@ temperatures and data times are read from `experimental_data.csv`. Adding a
 
 ## Key modeling decisions (see `main.py` docstring for the full assumptions)
 
-- **Fit Mn against Mn** at 10/20/40/60 min. The **720‑min** point is *not* a
-  residual — it sets the **effective initiator** `n_I,eff = 4.0000 g / Mn₇₂₀`
-  (column `n_sbuli_eff_mol`), so each sim matches its final Mn by construction
-  and the intermediate shape is pure `ki`/`kp` kinetics.
+- **Fit Mn against Mn** at 10/20/40/60 min. The **720‑min** full‑conversion point
+  is excluded from the residuals. The simulation uses the **charged s‑BuLi**
+  (`n_sbuli_charged_mol`) exactly as entered, so absolute Mn is a genuine prediction.
 - **Conversion is a diagnostic only** (the data’s `X(t)=Mn(t)/Mn₇₂₀` carries no
   information independent of Mn).
 - **`kp`** is well constrained (Mn growth rate); **`ki`** is weak (early‑time

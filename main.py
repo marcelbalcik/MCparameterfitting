@@ -36,9 +36,9 @@ WHAT THIS PROGRAM DOES / DOES NOT TOUCH
   experiment.json (recipe + temperature + sim settings, written once at --setup)
   and coeffs.json (the {"ki":.., "kp":..} for the current evaluation, rewritten
   every optimizer iteration).
-* It fits Mn ONLY at 10/20/40/60 min.  The 720-min row is NOT a residual; it is
-  used (as n_sbuli_eff_mol, precomputed in the CSV) to set the effective
-  initiator so each sim reproduces its final Mn by construction.
+* It fits Mn ONLY at 10/20/40/60 min.  The 720-min full-conversion row is excluded
+  from the residuals.  The simulation uses the CHARGED s-BuLi (n_sbuli_charged_mol)
+  exactly as entered.
 * Conversion is a DIAGNOSTIC only (never in the objective).
 
 --------------------------------------------------------------------------------
@@ -138,8 +138,6 @@ CONFIG = {
     "T_ref_C":             0.0,               # T[K] = T[C] + 273.15
     "T_offset_K":          273.15,
     "monomer_mw":          104.15,            # styrene, g/mol (for Mn/DP diagnostics)
-    "charge_mass_g":       4.0000,            # (informational) nominal styrene charge; the n_I,eff
-                                              # cross-check uses M0*n_styrene per experiment, not this
 
     # ---- simulation settings written into experiment.json --------------------
     "dt_s":                1,                 # volume-balance update step (integer seconds)
@@ -311,7 +309,7 @@ class Experiment:
     """One experiment (one `code`): its recipe, temperature, and Mn(t) targets."""
     def __init__(self, code: str, temperature_C: float, n_styrene_mol: float,
                  n_sbuli_charged_mol: float, n_cyclohexane_mol: float,
-                 n_sbuli_eff_mol: float, fit_times_s, Mn_by_time: dict,
+                 fit_times_s, Mn_by_time: dict,
                  Mn720: float, D_by_time: dict | None = None,
                  Mw_by_time: dict | None = None):
         self.code = code
@@ -319,16 +317,11 @@ class Experiment:
         self.n_styrene_mol = float(n_styrene_mol)
         self.n_sbuli_charged_mol = float(n_sbuli_charged_mol)
         self.n_cyclohexane_mol = float(n_cyclohexane_mol)
-        self.n_sbuli_eff_mol = float(n_sbuli_eff_mol)
         self.fit_times_s = [int(t) for t in fit_times_s]
         self.Mn_by_time = {int(t): float(v) for t, v in Mn_by_time.items()}
         self.Mn720 = float(Mn720)
         self.D_by_time = D_by_time or {}
         self.Mw_by_time = Mw_by_time or {}   # experimental Mw(t) from the CSV `exp_Mw` column
-
-    @property
-    def titer_ratio(self) -> float:
-        return self.n_sbuli_eff_mol / self.n_sbuli_charged_mol
 
 
 def _read_table(csv_path: Path):
@@ -374,17 +367,12 @@ def load_experiments(csv_path: Path):
             Mw_by_time = {int(t): float(w) for t, w in zip(fit_rows["time_s"], fit_rows["exp_Mw"])
                           if pd.notna(w)}
         r0 = g.iloc[0]
-        # n_sbuli_eff_mol is now optional (the sim uses the charged initiator);
-        # keep it only if present, for the report's titer diagnostic.
-        n_eff = float(r0["n_sbuli_eff_mol"]) if "n_sbuli_eff_mol" in df.columns \
-            else float(r0["n_sbuli_charged_mol"])
         exp = Experiment(
             code=str(code),
             temperature_C=r0["temperature_C"],
             n_styrene_mol=r0["n_styrene_mol"],
             n_sbuli_charged_mol=r0["n_sbuli_charged_mol"],
             n_cyclohexane_mol=r0["n_cyclohexane_mol"],
-            n_sbuli_eff_mol=n_eff,
             fit_times_s=fit_times,
             Mn_by_time=Mn_by_time,
             Mn720=Mn720,
@@ -446,9 +434,9 @@ def setup_folders(exps, numMolecules: int):
         shutil.copy2(model, folder / CONFIG["model_template"])
         with open(folder / "experiment.json", "w") as fh:
             json.dump(make_experiment_json(exp, numMolecules), fh, indent=2)
-        LOG.info("[setup] %-6s  T=%4.1f C  n_I,eff=%.4e  titer(eff/charged)=%5.1f%%  -> %s",
-                 exp.code, exp.temperature_C, exp.n_sbuli_eff_mol,
-                 100 * exp.titer_ratio, folder)
+        LOG.info("[setup] %-6s  T=%4.1f C  n_sbuli=%.4e  n_styrene=%.4e  -> %s",
+                 exp.code, exp.temperature_C, exp.n_sbuli_charged_mol,
+                 exp.n_styrene_mol, folder)
     LOG.info("[setup] built %d experiment folders under %s (numMolecules=%.2e)",
              len(exps), Path(CONFIG["repo_dir"]) / CONFIG["work_root"], numMolecules)
 
@@ -680,11 +668,10 @@ def read_conversion(run_dir: Path) -> dict:
 # exports MMD-S-600.dat every run, so the simulated side is free; we only add
 # the experimental curve + a distribution distance.
 #
-# Consistency note on the M-axis: n_I,eff is derived from the SEC Mn(720), so
-# the simulation's absolute molar-mass axis is tied to the SAME SEC calibration
-# as the experimental curve — L2 over log10(M) is therefore meaningful. If your
-# SEC M-axis is only relative/PS-equivalent, prefer mmd_metric="dispersity" or
-# "wasserstein" (less sensitive to an absolute peak-position offset).
+# Note on the M-axis: the simulated distribution is on an absolute molar-mass axis
+# while the experimental curve is SEC-calibrated. If the two don't share an
+# absolute scale, prefer mmd_metric="dispersity" or "wasserstein" (less sensitive
+# to an absolute peak-position offset) over the position-sensitive L2.
 
 def load_norm_curve(path: Path, force: str):
     """Load a two-column MMD -> (x=log10 M, w=dw/dlog10 M) normalized to unit area."""
@@ -1250,8 +1237,8 @@ def _ki_points_to_arrhenius(ki_by_T, temps_with, stage1, fixed_Ea_kJ, tag):
 # =============================================================================
 # Stage-ki (Mw) — determine ki from experimental Mw fed in the CSV  (--stage-ki-mw)
 # =============================================================================
-# Alternative to the MMD-shape stage when you have Mw (not full curves).  Since
-# n_I,eff fixes the chain count and kp(T) is held at the stage-1 value, the ONLY
+# Alternative to the MMD-shape stage when you have Mw (not full curves).  With the
+# initiator fixed by the recipe and kp(T) held at the stage-1 value, the ONLY
 # free lever left in Mw(early time) is the distribution breadth — i.e. ki.  Same
 # structure: fit ki(T) per temperature, then ki(T) -> Arrhenius, fed to stage 2
 # as a fixed ki.  Provide Mw in the CSV as an `exp_Mw` column (g/mol) on the
@@ -1469,9 +1456,8 @@ def load_predict_specs(path: Path):
             code=str(r["code"]),
             temperature_C=r["temperature_C"],
             n_styrene_mol=r["n_styrene_mol"],
-            n_sbuli_charged_mol=n_sbuli,   # the sim uses the charged column -> put the supplied initiator here
+            n_sbuli_charged_mol=n_sbuli,   # the supplied initiator, used as-is
             n_cyclohexane_mol=r["n_cyclohexane_mol"],
-            n_sbuli_eff_mol=n_sbuli,       # unused for prediction
             fit_times_s=times,
             Mn_by_time={t: float("nan") for t in times},   # no targets — prediction only
             Mn720=1.0,
@@ -1745,16 +1731,14 @@ def write_report(exps, params, stage1, screen, verify, out_dir: Path, run_dir: P
     else:
         lines.append("_No fitted parameters yet (run --stage1/--stage2)._\n")
 
-    lines.append("## Initiator\n")
+    lines.append("## Recipe\n")
     lines.append("The simulation uses the **charged s-BuLi** (`n_sbuli_charged_mol`) exactly as "
-                 "entered — no effective-initiator substitution. Because the chain count is the "
-                 "charged titer (not back-solved from Mn₇₂₀), absolute Mn is a genuine prediction, "
-                 "not matched by construction.\n")
-    lines.append("| code | T (°C) | Mn₇₂₀ | n_sbuli_charged (mol) |")
-    lines.append("|---|---|---|---|")
+                 "entered; absolute Mn is therefore a genuine prediction.\n")
+    lines.append("| code | T (°C) | n_styrene (mol) | n_sbuli (mol) | n_cyclohexane (mol) |")
+    lines.append("|---|---|---|---|---|")
     for e in exps:
-        lines.append(f"| {e.code} | {e.temperature_C:.0f} | {e.Mn720:.0f} | "
-                     f"{e.n_sbuli_charged_mol:.4e} |")
+        lines.append(f"| {e.code} | {e.temperature_C:.0f} | {e.n_styrene_mol:.4e} | "
+                     f"{e.n_sbuli_charged_mol:.4e} | {e.n_cyclohexane_mol:.4e} |")
     lines.append("")
 
     if stage1 is not None:
@@ -1854,7 +1838,7 @@ def write_report(exps, params, stage1, screen, verify, out_dir: Path, run_dir: P
     lines.append("- **Objective:** squared residuals on **Mn** at 10/20/40/60 min, "
                  f"`{CONFIG['residual_kind']}` scale, normalized `{CONFIG['loss_normalization']}` "
                  "so the four 30 °C experiments do not swamp the two 20 °C experiments. The "
-                 "720-min point is excluded from the residuals (used only to set n_I,eff).")
+                 "720-min full-conversion point is excluded from the residuals.")
     if CONFIG["joint_breadth_enable"]:
         obs = "Đ = Mw/Mn" if CONFIG["joint_breadth_observable"] != "mw" else "Mw"
         lines.append(f"- **Joint objective (ON):** ki and kp were fit **together** in one coupled "
