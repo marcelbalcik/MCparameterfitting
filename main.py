@@ -16,6 +16,7 @@ Run it on the workstation where the mcPolymer engine lives:
     python main.py --stage-ki-mw    # (opt-in) determine ki from experimental Mw in the CSV (exp_Mw column)
     python main.py --stage2         # coupled Arrhenius refinement (holds ki fixed if a ki stage ran)
     python main.py --verify         # re-run best fit K times at verification resolution
+    python main.py --predict        # predict Mn(t) for NEW recipes in predict.csv (T + moles only)
     python main.py --all            # setup -> stage1 -> screen -> stage2 -> verify -> report  (NO ki stage)
     python main.py --all-ki         # same as --all but WITH the MMD ki stage
     python main.py --all-ki-mw      # same as --all but WITH the Mw ki stage (CSV exp_Mw)
@@ -150,6 +151,15 @@ CONFIG = {
     # ---- replicates (noise averaging) ---------------------------------------
     "K_replicates_fit":     1,                # replicates per evaluation during fitting
     "K_replicates_verify":  5,                # replicates for the final verification scatter
+
+    # ---- prediction (--predict): forward-run NEW recipes, no Mn data needed ---
+    # predict.csv columns: code, temperature_C, n_styrene_mol, n_sbuli_mol,
+    # n_cyclohexane_mol  (n_sbuli_mol = the initiator to use; it's used as-is).
+    "predict_csv":          "predict.csv",
+    "predict_times_s":      [600, 1200, 2400, 3600],   # export times for the prediction (any list, seconds)
+    "predict_numMolecules": 100_000_000,      # resolution for prediction runs
+    "predict_reps":         3,                # replicates -> a scatter band on predicted Mn
+    "predict_work_root":    "predict_work",   # folders for prediction runs (kept apart from work/)
 
     # ---- Mn extraction -------------------------------------------------------
     "force_x_col":          "auto",           # "auto"|"c0"|"c1"|"swap" (assumption A2)
@@ -1417,6 +1427,124 @@ def run_verify(exps, params: dict) -> dict:
 
 
 # =============================================================================
+# prediction  (--predict): forward-run NEW recipes from T + moles only
+# =============================================================================
+def load_predict_specs(path: Path):
+    """Read predict.csv (T + initial moles, NO Mn data) into lightweight Experiment
+    objects. Required columns: code, temperature_C, n_styrene_mol, n_sbuli_mol,
+    n_cyclohexane_mol. (n_sbuli_charged_mol is accepted as an alias for n_sbuli_mol.)
+    The prediction export times come from CONFIG['predict_times_s']."""
+    df, sep = _read_table(path)
+    if "n_sbuli_mol" not in df.columns and "n_sbuli_charged_mol" in df.columns:
+        df = df.rename(columns={"n_sbuli_charged_mol": "n_sbuli_mol"})
+    required = {"code", "temperature_C", "n_styrene_mol", "n_sbuli_mol", "n_cyclohexane_mol"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{path} is missing columns: {sorted(missing)}  "
+                         f"(found: {sorted(df.columns)}; separator '{sep}')")
+    times = [int(t) for t in CONFIG["predict_times_s"]]
+    specs = []
+    for _, r in df.iterrows():
+        n_sbuli = float(r["n_sbuli_mol"])
+        specs.append(Experiment(
+            code=str(r["code"]),
+            temperature_C=r["temperature_C"],
+            n_styrene_mol=r["n_styrene_mol"],
+            n_sbuli_charged_mol=n_sbuli,   # the sim uses the charged column -> put the supplied initiator here
+            n_cyclohexane_mol=r["n_cyclohexane_mol"],
+            n_sbuli_eff_mol=n_sbuli,       # unused for prediction
+            fit_times_s=times,
+            Mn_by_time={t: float("nan") for t in times},   # no targets — prediction only
+            Mn720=1.0,
+        ))
+    return specs
+
+
+def run_predict(params: dict, run_dir: Path, predict_csv=None):
+    """Predict Mn(t) (+ Mw, Đ) for each recipe in predict.csv using the fitted
+    Arrhenius params. No experimental Mn needed; no loss computed."""
+    path = Path(predict_csv) if predict_csv else repo_path(CONFIG["predict_csv"])
+    if not path.exists():
+        LOG.error("[predict] recipe file not found: %s  (create it — see README)", path)
+        return None
+    if params is None:
+        LOG.error("[predict] no fitted parameters available (run --stage2 first, or ensure a "
+                  "best_params.json exists under results/).")
+        return None
+    specs = load_predict_specs(path)
+    LOG.info("[predict] %d recipe(s) from %s using A_ki=%.3e Ea_ki=%.1fkJ A_kp=%.3e Ea_kp=%.1fkJ",
+             len(specs), path.name, params["A_ki"], params["Ea_ki"]/1000,
+             params["A_kp"], params["Ea_kp"]/1000)
+    coeffs_by_code = {e.code: coeffs_for(e, params) for e in specs}
+    for e in specs:
+        c = coeffs_by_code[e.code]
+        LOG.info("[predict] %-10s T=%5.1f C  ki=%.5g  kp=%.5g", e.code, e.temperature_C,
+                 c["ki"], c["kp"])
+
+    nMol = int(CONFIG["predict_numMolecules"]); K = int(CONFIG["predict_reps"])
+    LOG.info("[predict] running %d recipe(s) x %d replicate(s) at numMolecules=%.1e",
+             len(specs), K, nMol)
+    old_root = CONFIG["work_root"]
+    CONFIG["work_root"] = CONFIG["predict_work_root"]     # keep prediction folders apart from work/
+    try:
+        results = run_all(specs, coeffs_by_code, nMol, K)
+    finally:
+        CONFIG["work_root"] = old_root
+
+    rows = []
+    for e in specs:
+        c = coeffs_by_code[e.code]; pt = results[e.code]["per_time"]
+        if results[e.code]["errors"]:
+            LOG.warning("[predict] %s: %s", e.code, results[e.code]["errors"])
+        for t in e.fit_times_s:
+            s = pt.get(t, {})
+            rows.append({
+                "code": e.code, "temperature_C": e.temperature_C,
+                "ki": c["ki"], "kp": c["kp"],
+                "n_styrene_mol": e.n_styrene_mol, "n_sbuli_mol": e.n_sbuli_charged_mol,
+                "n_cyclohexane_mol": e.n_cyclohexane_mol,
+                "time_s": t, "time_min": t / 60.0,
+                "Mn_pred": s.get("Mn", float("nan")), "Mn_std": s.get("Mn_std", float("nan")),
+                "Mw_pred": s.get("Mw", float("nan")), "D_pred": s.get("D", float("nan")),
+                "n_rep": s.get("n_rep", 0),
+            })
+    df_out = pd.DataFrame(rows)
+    out_csv = run_dir / "predictions.csv"
+    df_out.to_csv(out_csv, index=False)
+    LOG.info("[predict] wrote %s (%d rows)", out_csv, len(df_out))
+    make_predict_plot(specs, results, run_dir / "plots")
+    return {"specs": specs, "results": results, "coeffs": coeffs_by_code, "csv": str(out_csv)}
+
+
+def make_predict_plot(specs, results, out_dir: Path):
+    if not _HAVE_MPL:
+        return None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    any_pts = False
+    for e in specs:
+        pt = results[e.code]["per_time"]
+        ts = [t for t in e.fit_times_s if t in pt]
+        if not ts:
+            continue
+        any_pts = True
+        mn = [pt[t]["Mn"] for t in ts]
+        sd = [pt[t].get("Mn_std", 0.0) for t in ts]
+        ax.errorbar([t / 60 for t in ts], mn, yerr=sd, marker="o", capsize=3,
+                    label=f"{e.code} ({e.temperature_C:.0f} °C)")
+    if not any_pts:
+        plt.close(fig); return None
+    ax.set_xlabel("t (min)"); ax.set_ylabel("predicted Mn (g/mol)")
+    ax.set_title("Predicted Mn(t) — fitted model applied to new recipes")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    p = out_dir / "predictions.png"
+    fig.savefig(p, dpi=120); plt.close(fig)
+    LOG.info("[predict] wrote %s", p)
+    return p
+
+
+# =============================================================================
 # plots + report
 # =============================================================================
 def _mn_table(exps, results):
@@ -1851,6 +1979,10 @@ def build_argparser():
                     help="determine ki from experimental Mw in the CSV (exp_Mw column; between stage1 & stage2)")
     ap.add_argument("--verify", action="store_true",
                     help="re-run best fit K times at verification resolution")
+    ap.add_argument("--predict", action="store_true",
+                    help="predict Mn(t) for NEW recipes in predict.csv (T + moles only) using the fitted params")
+    ap.add_argument("--predict-csv", dest="predict_csv", default=None,
+                    help="path to the prediction recipe CSV (default: predict.csv)")
     ap.add_argument("--report", action="store_true",
                     help="(re)write report.md + plots from the latest results")
     ap.add_argument("--all", action="store_true",
@@ -1888,14 +2020,24 @@ def main(argv=None):
     write_manifest(run_dir, args)
     LOG.info("results dir: %s", run_dir)
 
+    # --predict is self-contained (predict.csv + best_params.json); it does not
+    # need the experimental fit data, so allow it to run without experimental_data.csv.
+    predict_only = args.predict and not any([
+        args.setup, args.single, args.eval_once, args.screen, args.stage1, args.stage2,
+        args.stage_ki, args.stage_ki_mw, args.verify, args.report, run_full])
     data_csv = repo_path(CONFIG["data_csv"])
     if not data_csv.exists():
-        LOG.error("data CSV not found: %s", data_csv)
-        return 2
-    exps = load_experiments(data_csv)
-    LOG.info("loaded %d experiments: %s", len(exps), ", ".join(e.code for e in exps))
-    LOG.info("temperatures: %s C ; fit times: %s s",
-             temperatures(exps), all_fit_times(exps))
+        if predict_only:
+            LOG.warning("no experimental_data.csv — prediction-only run", )
+            exps = []
+        else:
+            LOG.error("data CSV not found: %s", data_csv)
+            return 2
+    else:
+        exps = load_experiments(data_csv)
+        LOG.info("loaded %d experiments: %s", len(exps), ", ".join(e.code for e in exps))
+        LOG.info("temperatures: %s C ; fit times: %s s",
+                 temperatures(exps), all_fit_times(exps))
 
     evallog = EvalLogger(run_dir / "eval_log.csv", [e.code for e in exps])
     nMol_fit = CONFIG["numMolecules_fit"]
@@ -1924,7 +2066,7 @@ def main(argv=None):
     # nothing selected -> show help
     if not any([args.setup, args.single, args.eval_once, args.screen,
                 args.stage1, args.stage2, args.stage_ki, args.stage_ki_mw, args.verify,
-                args.report, args.all, args.all_ki, args.all_ki_mw]):
+                args.predict, args.report, args.all, args.all_ki, args.all_ki_mw]):
         build_argparser().print_help()
         return 0
 
@@ -2054,6 +2196,12 @@ def main(argv=None):
                             "numMolecules": verify["numMolecules"], "K": verify["K"]}, indent=2))
             last_results = verify["results"]
             did_something = True
+
+    # ---- predict (NEW recipes; independent of the fit data) ------------------
+    if args.predict:
+        params = best or load_latest_best_params()
+        run_predict(params, run_dir, predict_csv=args.predict_csv)
+        did_something = True
 
     # ---- report + plots -----------------------------------------------------
     if args.report or run_full or args.stage2 or args.stage_ki or args.verify or args.eval_once:
