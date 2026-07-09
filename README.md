@@ -26,7 +26,9 @@ modified) via two JSON files it reads (`experiment.json`, `coeffs.json`).
 
 Generated at runtime (git‑ignored): `work/<CODE>/` experiment folders and
 `results/<timestamp>/` outputs (`best_params.*`, `report.md`, `plots/`,
-`eval_log.csv`, `manifest.json`).
+`eval_log.csv`, `manifest.json`, and **`mn_results.csv`** — the per‑experiment,
+per‑time table of `Mn_exp`, `Mn_sim`, `Mn_sim_std`, `Mn_pct_error`, `Mw_sim`,
+`D_sim`, i.e. the data behind the Mn overlay plots).
 
 ## Install
 
